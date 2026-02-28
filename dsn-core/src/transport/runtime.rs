@@ -1,15 +1,19 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::fs;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{WebSocketStream, accept_async, client_async};
 use tracing::{info, warn};
 
 use super::{TransportEndpoint, TransportParam, TransportScheme, parse_bool_param};
@@ -90,24 +94,7 @@ impl Transport for TlsTransport {
             );
         }
 
-        let cert_path = endpoint
-            .params
-            .get(TransportParam::Cert.as_str())
-            .ok_or_else(|| anyhow!("tls listen requires query param 'cert' with PEM path"))?;
-        let key_path = endpoint
-            .params
-            .get(TransportParam::Key.as_str())
-            .ok_or_else(|| anyhow!("tls listen requires query param 'key' with PEM path"))?;
-
-        let cert_chain = load_cert_chain(cert_path)?;
-        let private_key = load_private_key(key_path)?;
-
-        let server_cfg = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, private_key)
-            .context("failed to build rustls server config")?;
-
-        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+        let tls_acceptor = build_server_tls_acceptor(endpoint)?;
         let bind_addr = endpoint_socket_addr(endpoint)?;
         let listener = TcpListener::bind(bind_addr)
             .await
@@ -117,7 +104,7 @@ impl Transport for TlsTransport {
             .await
             .with_context(|| format!("failed to accept first tls client on {bind_addr}"))?;
 
-        let tls_stream = acceptor
+        let tls_stream = tls_acceptor
             .accept(stream)
             .await
             .context("failed tls server handshake")?;
@@ -133,52 +120,120 @@ impl Transport for TlsTransport {
             );
         }
 
-        let insecure = endpoint
-            .params
-            .get(TransportParam::Insecure.as_str())
-            .map(|value| parse_bool_param(value))
-            .transpose()?
-            .unwrap_or(false);
-
-        if insecure {
-            warn!("TLS trust mode: insecure (certificate verification disabled)");
-            let remote_addr = endpoint_socket_addr(endpoint)?;
-            let stream = TcpStream::connect(remote_addr)
-                .await
-                .with_context(|| format!("failed to connect tls stream to {remote_addr}"))?;
-
-            let config = ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-                .with_no_client_auth();
-            let connector = TlsConnector::from(Arc::new(config));
-            let server_name = endpoint_server_name(endpoint)?;
-            let tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .context("failed tls client handshake (insecure mode)")?;
-
-            return Ok(Connection::Stream(Box::new(tls_stream)));
-        }
-
-        let root_store = build_client_root_store(endpoint)?;
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        let connector = TlsConnector::from(Arc::new(config));
         let remote_addr = endpoint_socket_addr(endpoint)?;
         let stream = TcpStream::connect(remote_addr)
             .await
             .with_context(|| format!("failed to connect tls stream to {remote_addr}"))?;
 
-        let server_name = endpoint_server_name(endpoint)?;
-        let tls_stream = connector
-            .connect(server_name, stream)
-            .await
-            .context("failed tls client handshake")?;
-
+        let tls_stream = connect_tls_stream(endpoint, stream).await?;
         Ok(Connection::Stream(Box::new(tls_stream)))
+    }
+}
+
+pub struct WsTransport;
+
+#[async_trait]
+impl Transport for WsTransport {
+    async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Ws {
+            bail!(
+                "ws transport requires ws:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let bind_addr = endpoint_socket_addr(endpoint)?;
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("failed to bind ws listener on {bind_addr}"))?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| format!("failed to accept first ws client on {bind_addr}"))?;
+
+        let ws_stream = accept_async(stream)
+            .await
+            .context("failed websocket server handshake")?;
+
+        Ok(Connection::Stream(websocket_as_read_write(ws_stream)))
+    }
+
+    async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Ws {
+            bail!(
+                "ws transport requires ws:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let remote_addr = endpoint_socket_addr(endpoint)?;
+        let stream = TcpStream::connect(remote_addr)
+            .await
+            .with_context(|| format!("failed to connect ws tcp stream to {remote_addr}"))?;
+        let request = websocket_client_request(endpoint)?;
+
+        let (ws_stream, _) = client_async(request, stream)
+            .await
+            .context("failed websocket client handshake")?;
+
+        Ok(Connection::Stream(websocket_as_read_write(ws_stream)))
+    }
+}
+
+pub struct WssTransport;
+
+#[async_trait]
+impl Transport for WssTransport {
+    async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Wss {
+            bail!(
+                "wss transport requires wss:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let tls_acceptor = build_server_tls_acceptor(endpoint)?;
+        let bind_addr = endpoint_socket_addr(endpoint)?;
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("failed to bind wss listener on {bind_addr}"))?;
+        let (tcp_stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| format!("failed to accept first wss client on {bind_addr}"))?;
+
+        let tls_stream = tls_acceptor
+            .accept(tcp_stream)
+            .await
+            .context("failed tls handshake for wss listener")?;
+
+        let ws_stream = accept_async(tls_stream)
+            .await
+            .context("failed websocket upgrade on tls stream")?;
+
+        Ok(Connection::Stream(websocket_as_read_write(ws_stream)))
+    }
+
+    async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Wss {
+            bail!(
+                "wss transport requires wss:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let remote_addr = endpoint_socket_addr(endpoint)?;
+        let tcp_stream = TcpStream::connect(remote_addr)
+            .await
+            .with_context(|| format!("failed to connect wss tcp stream to {remote_addr}"))?;
+        let tls_stream = connect_tls_stream(endpoint, tcp_stream).await?;
+        let request = websocket_client_request(endpoint)?;
+
+        let (ws_stream, _) = client_async(request, tls_stream)
+            .await
+            .context("failed websocket upgrade over tls stream")?;
+
+        Ok(Connection::Stream(websocket_as_read_write(ws_stream)))
     }
 }
 
@@ -304,11 +359,211 @@ pub fn transport_for_scheme(scheme: TransportScheme) -> Result<Box<dyn Transport
     match scheme {
         TransportScheme::Tcp => Ok(Box::new(TcpRawTransport)),
         TransportScheme::Tls => Ok(Box::new(TlsTransport)),
+        TransportScheme::Ws => Ok(Box::new(WsTransport)),
+        TransportScheme::Wss => Ok(Box::new(WssTransport)),
         TransportScheme::Udp => Ok(Box::new(UdpRawTransport)),
         _ => Err(anyhow!(
             "transport scheme '{scheme}' is not implemented in raw runtime yet"
         )),
     }
+}
+
+fn build_server_tls_acceptor(endpoint: &TransportEndpoint) -> Result<TlsAcceptor> {
+    let cert_path = endpoint
+        .params
+        .get(TransportParam::Cert.as_str())
+        .ok_or_else(|| anyhow!("tls/wss listen requires query param 'cert' with PEM path"))?;
+    let key_path = endpoint
+        .params
+        .get(TransportParam::Key.as_str())
+        .ok_or_else(|| anyhow!("tls/wss listen requires query param 'key' with PEM path"))?;
+
+    let cert_chain = load_cert_chain(cert_path)?;
+    let private_key = load_private_key(key_path)?;
+
+    let server_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .context("failed to build rustls server config")?;
+
+    Ok(TlsAcceptor::from(Arc::new(server_cfg)))
+}
+
+async fn connect_tls_stream(
+    endpoint: &TransportEndpoint,
+    stream: TcpStream,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let insecure = endpoint
+        .params
+        .get(TransportParam::Insecure.as_str())
+        .map(|value| parse_bool_param(value))
+        .transpose()?
+        .unwrap_or(false);
+
+    if insecure {
+        warn!("TLS trust mode: insecure (certificate verification disabled)");
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = endpoint_server_name(endpoint)?;
+        return connector
+            .connect(server_name, stream)
+            .await
+            .context("failed tls client handshake (insecure mode)");
+    }
+
+    let root_store = build_client_root_store(endpoint)?;
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = endpoint_server_name(endpoint)?;
+    connector
+        .connect(server_name, stream)
+        .await
+        .context("failed tls client handshake")
+}
+
+fn websocket_client_request(
+    endpoint: &TransportEndpoint,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let target = websocket_target_url(endpoint)?;
+    let mut request = target
+        .into_client_request()
+        .map_err(|err| anyhow!("failed to initialize websocket client request: {err}"))?;
+
+    let host_header = format!("{}:{}", endpoint.host, endpoint.port);
+    request.headers_mut().insert(
+        http::header::HOST,
+        host_header
+            .parse()
+            .map_err(|err| anyhow!("invalid Host header value: {err}"))?,
+    );
+
+    if let Some(origin) = endpoint.params.get("origin") {
+        request.headers_mut().insert(
+            http::header::ORIGIN,
+            origin
+                .parse()
+                .map_err(|err| anyhow!("invalid Origin header value: {err}"))?,
+        );
+    }
+
+    for (key, value) in &endpoint.params {
+        if let Some(name) = key.strip_prefix("header.") {
+            request.headers_mut().insert(
+                http::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|err| anyhow!("invalid header name '{name}': {err}"))?,
+                value
+                    .parse()
+                    .map_err(|err| anyhow!("invalid header value for '{name}': {err}"))?,
+            );
+        }
+    }
+
+    Ok(request)
+}
+
+fn websocket_target_url(endpoint: &TransportEndpoint) -> Result<String> {
+    let scheme = match endpoint.scheme {
+        TransportScheme::Ws => "ws",
+        TransportScheme::Wss => "wss",
+        _ => bail!("websocket target URL is available only for ws/wss schemes"),
+    };
+
+    let path = endpoint.path.as_deref().unwrap_or("/");
+    let mut query_pairs = Vec::new();
+    for (key, value) in &endpoint.params {
+        if key.starts_with("header.") {
+            continue;
+        }
+        if matches!(
+            key.as_str(),
+            "servername" | "ca" | "cert" | "key" | "insecure" | "alpn" | "origin"
+        ) {
+            continue;
+        }
+        query_pairs.push(format!(
+            "{}={}",
+            urlencoding::encode(key),
+            urlencoding::encode(value)
+        ));
+    }
+
+    let mut url = format!("{scheme}://{}:{}{path}", endpoint.host, endpoint.port);
+    if !query_pairs.is_empty() {
+        url.push('?');
+        url.push_str(&query_pairs.join("&"));
+    }
+
+    Ok(url)
+}
+
+fn websocket_as_read_write<S>(ws_stream: WebSocketStream<S>) -> BoxedStreamConn
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (local_end, bridge_end) = io::duplex(64 * 1024);
+    let (mut bridge_reader, mut bridge_writer) = io::split(bridge_end);
+    let (mut ws_sink, mut ws_source) = ws_stream.split();
+
+    tokio::spawn(async move {
+        while let Some(message) = ws_source.next().await {
+            match message {
+                Ok(Message::Binary(payload)) => {
+                    if bridge_writer.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                    if bridge_writer.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Text(payload)) => {
+                    if bridge_writer.write_all(payload.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if bridge_writer.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    break;
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+                Ok(Message::Frame(_)) => {}
+                Err(_) => break,
+            }
+        }
+
+        let _ = bridge_writer.shutdown().await;
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match bridge_reader.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = ws_sink.send(Message::Close(None)).await;
+                    break;
+                }
+                Ok(size) => {
+                    if ws_sink
+                        .send(Message::Binary(buf[..size].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Box::new(local_end)
 }
 
 fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
@@ -341,17 +596,10 @@ fn endpoint_server_name(endpoint: &TransportEndpoint) -> Result<ServerName<'stat
         .cloned()
         .unwrap_or_else(|| endpoint.host.clone());
 
-    ServerName::try_from(value)
+    ServerName::try_from(value.clone())
         .map(|name| name.to_owned())
         .map_err(|_| {
-            anyhow!(
-                "invalid servername value for tls handshake: expected DNS name, got '{}'",
-                endpoint
-                    .params
-                    .get(TransportParam::ServerName.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| endpoint.host.clone())
-            )
+            anyhow!("invalid servername value for tls handshake: expected DNS name, got '{value}'")
         })
 }
 
@@ -444,6 +692,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 mod tests {
     use super::{
         Connection, TcpRawTransport, TlsTransport, Transport, TransportEndpoint, UdpRawTransport,
+        WsTransport, WssTransport,
     };
     use anyhow::Result;
     use std::fs;
@@ -603,6 +852,126 @@ mod tests {
         let mut stream = match conn {
             Connection::Stream(stream) => stream,
             Connection::Datagram(_) => panic!("tls must return stream"),
+        };
+
+        stream.write_all(b"hello").await?;
+        let mut out = [0u8; 5];
+        stream.read_exact(&mut out).await?;
+        assert_eq!(&out, b"world");
+
+        server_task.await?;
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ws_transport_e2e_loopback() -> Result<()> {
+        let probe = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+
+        let listen_endpoint =
+            TransportEndpoint::from_str(&format!("ws://127.0.0.1:{}/chat", addr.port()))?;
+        let connect_endpoint = TransportEndpoint::from_str(&format!(
+            "ws://127.0.0.1:{}/chat?header.Origin=https://example.test",
+            addr.port()
+        ))?;
+
+        let server_task = tokio::spawn(async move {
+            let transport = WsTransport;
+            let conn = transport.listen(&listen_endpoint).await.expect("listen ws");
+            let mut stream = match conn {
+                Connection::Stream(stream) => stream,
+                Connection::Datagram(_) => panic!("ws must return stream"),
+            };
+
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await.expect("read ws payload");
+            assert_eq!(&buf, b"hello");
+            stream.write_all(b"world").await.expect("write ws payload");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let transport = WsTransport;
+        let conn = transport.connect(&connect_endpoint).await?;
+        let mut stream = match conn {
+            Connection::Stream(stream) => stream,
+            Connection::Datagram(_) => panic!("ws must return stream"),
+        };
+
+        stream.write_all(b"hello").await?;
+        let mut out = [0u8; 5];
+        stream.read_exact(&mut out).await?;
+        assert_eq!(&out, b"world");
+
+        server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wss_transport_e2e_with_self_signed_ca() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!(
+            "dsn-wss-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp)?;
+
+        let ca = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert_pem = ca.cert.pem();
+        let key_pem = ca.key_pair.serialize_pem();
+
+        let cert_path = tmp.join("server-cert.pem");
+        let key_path = tmp.join("server-key.pem");
+        let ca_path = tmp.join("ca.pem");
+        fs::write(&cert_path, &cert_pem)?;
+        fs::write(&key_path, &key_pem)?;
+        fs::write(&ca_path, &cert_pem)?;
+
+        let probe = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+
+        let listen_endpoint = TransportEndpoint::from_str(&format!(
+            "wss://127.0.0.1:{}/chat?cert={}&key={}",
+            addr.port(),
+            cert_path.display(),
+            key_path.display()
+        ))?;
+
+        let connect_endpoint = TransportEndpoint::from_str(&format!(
+            "wss://127.0.0.1:{}/chat?ca={}&servername=localhost&header.Origin=https://example.test",
+            addr.port(),
+            ca_path.display()
+        ))?;
+
+        let server_task = tokio::spawn(async move {
+            let transport = WssTransport;
+            let conn = transport
+                .listen(&listen_endpoint)
+                .await
+                .expect("listen wss");
+            let mut stream = match conn {
+                Connection::Stream(stream) => stream,
+                Connection::Datagram(_) => panic!("wss must return stream"),
+            };
+
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await.expect("read wss payload");
+            assert_eq!(&buf, b"hello");
+            stream.write_all(b"world").await.expect("write wss payload");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let transport = WssTransport;
+        let conn = transport.connect(&connect_endpoint).await?;
+        let mut stream = match conn {
+            Connection::Stream(stream) => stream,
+            Connection::Datagram(_) => panic!("wss must return stream"),
         };
 
         stream.write_all(b"hello").await?;

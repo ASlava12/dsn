@@ -13,6 +13,7 @@ pub use identity::generate_identity;
 
 pub use transport::{
     AsyncReadWrite, BoxedStreamConn, Connection, DatagramConn, TcpRawTransport, TlsTransport,
-    Transport, TransportEndpoint, TransportParam, TransportScheme, UdpRawTransport,
-    endpoint_socket_addr, parse_bool_param, reserved_transport_params, transport_for_scheme,
+    Transport, TransportEndpoint, TransportParam, TransportScheme, UdpRawTransport, WsTransport,
+    WssTransport, endpoint_socket_addr, parse_bool_param, reserved_transport_params,
+    transport_for_scheme,
 };

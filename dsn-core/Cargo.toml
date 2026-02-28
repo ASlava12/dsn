@@ -23,6 +23,10 @@ rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 tracing = "0.1"
+futures-util = "0.3"
+http = "1"
+tokio-tungstenite = "0.24"
+urlencoding = "2"
 
 [dev-dependencies]
 rcgen = "0.13"
