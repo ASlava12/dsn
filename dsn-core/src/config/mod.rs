@@ -51,8 +51,8 @@ impl DsnConfig {
         validate_key_field("public_key", &self.identity.public_key)?;
         validate_key_field("private_key", &self.identity.private_key)?;
 
-        if self.identity.id.len() != 256 {
-            bail!("identity.id must contain 256 hex characters");
+        if self.identity.id.len() != 64 {
+            bail!("identity.id must contain 64 hex characters (256 bits)");
         }
 
         if !self.identity.id.chars().all(|ch| ch.is_ascii_hexdigit()) {
