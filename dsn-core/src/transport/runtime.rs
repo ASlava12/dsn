@@ -1,12 +1,16 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use quinn::{
+    ClientConfig as QuinnClientConfig, Endpoint as QuinnEndpoint, ServerConfig as QuinnServerConfig,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::fs;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Once;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
@@ -39,6 +43,14 @@ pub trait DatagramConn: Send + Sync {
 pub trait Transport: Send + Sync {
     async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection>;
     async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection>;
+}
+
+
+fn ensure_rustls_crypto_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 pub struct TcpRawTransport;
@@ -237,6 +249,96 @@ impl Transport for WssTransport {
     }
 }
 
+pub struct QuicTransport;
+
+#[async_trait]
+impl Transport for QuicTransport {
+    async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Quic {
+            bail!(
+                "quic transport requires quic:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        info!(
+            "QUIC transport uses TLS1.3; certificate validation is required unless explicitly insecure"
+        );
+
+        let cert_path = endpoint
+            .params
+            .get(TransportParam::Cert.as_str())
+            .ok_or_else(|| anyhow!("quic listen requires query param 'cert' with PEM path"))?;
+        let key_path = endpoint
+            .params
+            .get(TransportParam::Key.as_str())
+            .ok_or_else(|| anyhow!("quic listen requires query param 'key' with PEM path"))?;
+
+        let cert_chain = load_cert_chain(cert_path)?;
+        let private_key = load_private_key(key_path)?;
+
+        let server_cfg = QuinnServerConfig::with_single_cert(cert_chain, private_key)
+            .context("failed to build quic server config")?;
+
+        let bind_addr = endpoint_socket_addr(endpoint)?;
+        let server_endpoint = QuinnEndpoint::server(server_cfg, bind_addr)
+            .with_context(|| format!("failed to bind quic endpoint on {bind_addr}"))?;
+
+        let incoming = server_endpoint
+            .accept()
+            .await
+            .ok_or_else(|| anyhow!("quic endpoint closed before first connection"))?;
+        let connection = incoming.await.context("failed quic server handshake")?;
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .context("failed to accept first quic bidi stream")?;
+
+        Ok(Connection::Stream(quic_bidi_as_read_write(recv, send)))
+    }
+
+    async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Quic {
+            bail!(
+                "quic transport requires quic:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        info!(
+            "QUIC transport uses TLS1.3; certificate validation is required unless explicitly insecure"
+        );
+
+        let remote_addr = endpoint_socket_addr(endpoint)?;
+        let mut client_endpoint = QuinnEndpoint::client("0.0.0.0:0".parse().expect("valid addr"))
+            .context("failed to create quic client endpoint")?;
+
+        let client_crypto = build_client_crypto_config(endpoint)?;
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+            .context("failed to convert rustls config for quic")?;
+        client_endpoint.set_default_client_config(QuinnClientConfig::new(Arc::new(quic_crypto)));
+
+        let server_name = endpoint_server_name(endpoint)?;
+        let server_name = match server_name {
+            ServerName::DnsName(name) => name.as_ref().to_string(),
+            _ => bail!("quic server_name must be DNS name"),
+        };
+
+        let connection = client_endpoint
+            .connect(remote_addr, &server_name)
+            .with_context(|| format!("failed to start quic connect to {remote_addr}"))?
+            .await
+            .context("failed quic client handshake")?;
+
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .context("failed to open first quic bidi stream")?;
+
+        Ok(Connection::Stream(quic_bidi_as_read_write(recv, send)))
+    }
+}
+
 pub struct UdpRawTransport;
 
 #[async_trait]
@@ -359,6 +461,7 @@ pub fn transport_for_scheme(scheme: TransportScheme) -> Result<Box<dyn Transport
     match scheme {
         TransportScheme::Tcp => Ok(Box::new(TcpRawTransport)),
         TransportScheme::Tls => Ok(Box::new(TlsTransport)),
+        TransportScheme::Quic => Ok(Box::new(QuicTransport)),
         TransportScheme::Ws => Ok(Box::new(WsTransport)),
         TransportScheme::Wss => Ok(Box::new(WssTransport)),
         TransportScheme::Udp => Ok(Box::new(UdpRawTransport)),
@@ -369,6 +472,7 @@ pub fn transport_for_scheme(scheme: TransportScheme) -> Result<Box<dyn Transport
 }
 
 fn build_server_tls_acceptor(endpoint: &TransportEndpoint) -> Result<TlsAcceptor> {
+    ensure_rustls_crypto_provider();
     let cert_path = endpoint
         .params
         .get(TransportParam::Cert.as_str())
@@ -393,6 +497,17 @@ async fn connect_tls_stream(
     endpoint: &TransportEndpoint,
     stream: TcpStream,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let config = build_client_crypto_config(endpoint)?;
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = endpoint_server_name(endpoint)?;
+    connector
+        .connect(server_name, stream)
+        .await
+        .context("failed tls client handshake")
+}
+
+fn build_client_crypto_config(endpoint: &TransportEndpoint) -> Result<ClientConfig> {
+    ensure_rustls_crypto_provider();
     let insecure = endpoint
         .params
         .get(TransportParam::Insecure.as_str())
@@ -402,29 +517,16 @@ async fn connect_tls_stream(
 
     if insecure {
         warn!("TLS trust mode: insecure (certificate verification disabled)");
-        let config = ClientConfig::builder()
+        return Ok(ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(config));
-        let server_name = endpoint_server_name(endpoint)?;
-        return connector
-            .connect(server_name, stream)
-            .await
-            .context("failed tls client handshake (insecure mode)");
+            .with_no_client_auth());
     }
 
     let root_store = build_client_root_store(endpoint)?;
-    let config = ClientConfig::builder()
+    Ok(ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = TlsConnector::from(Arc::new(config));
-    let server_name = endpoint_server_name(endpoint)?;
-    connector
-        .connect(server_name, stream)
-        .await
-        .context("failed tls client handshake")
+        .with_no_client_auth())
 }
 
 fn websocket_client_request(
@@ -500,6 +602,54 @@ fn websocket_target_url(endpoint: &TransportEndpoint) -> Result<String> {
     }
 
     Ok(url)
+}
+
+fn quic_bidi_as_read_write(
+    recv: quinn::RecvStream,
+    mut send: quinn::SendStream,
+) -> BoxedStreamConn {
+    let (local_end, bridge_end) = io::duplex(64 * 1024);
+    let (mut bridge_reader, mut bridge_writer) = io::split(bridge_end);
+    let mut recv_stream = recv;
+
+    tokio::spawn(async move {
+        loop {
+            match recv_stream.read_chunk(64 * 1024, true).await {
+                Ok(Some(chunk)) => {
+                    if bridge_writer.write_all(chunk.bytes.as_ref()).await.is_err() {
+                        break;
+                    }
+                    if bridge_writer.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        let _ = bridge_writer.shutdown().await;
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match bridge_reader.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = send.finish();
+                    break;
+                }
+                Ok(size) => {
+                    if send.write_all(&buf[..size]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Box::new(local_end)
 }
 
 fn websocket_as_read_write<S>(ws_stream: WebSocketStream<S>) -> BoxedStreamConn
@@ -691,8 +841,8 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 #[cfg(test)]
 mod tests {
     use super::{
-        Connection, TcpRawTransport, TlsTransport, Transport, TransportEndpoint, UdpRawTransport,
-        WsTransport, WssTransport,
+        Connection, QuicTransport, TcpRawTransport, TlsTransport, Transport, TransportEndpoint,
+        UdpRawTransport, WsTransport, WssTransport,
     };
     use anyhow::Result;
     use std::fs;
@@ -852,6 +1002,87 @@ mod tests {
         let mut stream = match conn {
             Connection::Stream(stream) => stream,
             Connection::Datagram(_) => panic!("tls must return stream"),
+        };
+
+        stream.write_all(b"hello").await?;
+        let mut out = [0u8; 5];
+        stream.read_exact(&mut out).await?;
+        assert_eq!(&out, b"world");
+
+        server_task.await?;
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quic_transport_e2e_with_custom_ca_and_servername() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!(
+            "dsn-quic-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp)?;
+
+        let ca = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert_pem = ca.cert.pem();
+        let key_pem = ca.key_pair.serialize_pem();
+
+        let cert_path = tmp.join("server-cert.pem");
+        let key_path = tmp.join("server-key.pem");
+        let ca_path = tmp.join("ca.pem");
+        fs::write(&cert_path, &cert_pem)?;
+        fs::write(&key_path, &key_pem)?;
+        fs::write(&ca_path, &cert_pem)?;
+
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+
+        let listen_endpoint = TransportEndpoint::from_str(&format!(
+            "quic://127.0.0.1:{}?cert={}&key={}",
+            addr.port(),
+            cert_path.display(),
+            key_path.display()
+        ))?;
+
+        let connect_endpoint = TransportEndpoint::from_str(&format!(
+            "quic://127.0.0.1:{}?ca={}&servername=localhost",
+            addr.port(),
+            ca_path.display()
+        ))?;
+
+        let server_task = tokio::spawn(async move {
+            let transport = QuicTransport;
+            let conn = transport
+                .listen(&listen_endpoint)
+                .await
+                .expect("listen quic");
+            let mut stream = match conn {
+                Connection::Stream(stream) => stream,
+                Connection::Datagram(_) => panic!("quic must return stream"),
+            };
+
+            let mut buf = [0u8; 5];
+            stream
+                .read_exact(&mut buf)
+                .await
+                .expect("read quic payload");
+            assert_eq!(&buf, b"hello");
+            stream
+                .write_all(b"world")
+                .await
+                .expect("write quic payload");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let transport = QuicTransport;
+        let conn = transport.connect(&connect_endpoint).await?;
+        let mut stream = match conn {
+            Connection::Stream(stream) => stream,
+            Connection::Datagram(_) => panic!("quic must return stream"),
         };
 
         stream.write_all(b"hello").await?;
