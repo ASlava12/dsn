@@ -6,9 +6,14 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::format::ConfigFormat;
 use crate::identity::generate_identity;
-use crate::value::set_in_value;
+
+pub mod format;
+pub mod paths;
+pub mod value;
+
+use format::ConfigFormat;
+use value::set_in_value;
 
 const ENV_PREFIX: &str = "DSN";
 

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 
-use crate::format::ConfigFormat;
+use super::format::ConfigFormat;
 
 const DEFAULT_CONFIG_DIR: &str = ".dsn";
 const DEFAULT_CONFIG_NAME: &str = "config.toml";
