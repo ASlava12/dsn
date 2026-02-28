@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use quinn::{
     ClientConfig as QuinnClientConfig, Endpoint as QuinnEndpoint, ServerConfig as QuinnServerConfig,
@@ -44,7 +45,6 @@ pub trait Transport: Send + Sync {
     async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection>;
     async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection>;
 }
-
 
 fn ensure_rustls_crypto_provider() {
     static INIT: Once = Once::new();
@@ -339,6 +339,112 @@ impl Transport for QuicTransport {
     }
 }
 
+pub struct H2Transport;
+
+#[async_trait]
+impl Transport for H2Transport {
+    async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::H2 {
+            bail!(
+                "h2 transport requires h2:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let tls_acceptor = build_server_tls_acceptor(endpoint)?;
+        let bind_addr = endpoint_socket_addr(endpoint)?;
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("failed to bind h2 listener on {bind_addr}"))?;
+        let (tcp_stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| format!("failed to accept first h2 client on {bind_addr}"))?;
+        let tls_stream = tls_acceptor
+            .accept(tcp_stream)
+            .await
+            .context("failed tls handshake for h2 listener")?;
+
+        accept_h2_tunnel(endpoint.path.as_deref().unwrap_or("/"), tls_stream, false).await
+    }
+
+    async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::H2 {
+            bail!(
+                "h2 transport requires h2:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let remote_addr = endpoint_socket_addr(endpoint)?;
+        let tcp_stream = TcpStream::connect(remote_addr)
+            .await
+            .with_context(|| format!("failed to connect h2 tcp stream to {remote_addr}"))?;
+        let tls_stream = connect_tls_stream(endpoint, tcp_stream).await?;
+
+        connect_h2_tunnel(
+            endpoint.path.as_deref().unwrap_or("/"),
+            endpoint,
+            tls_stream,
+            false,
+        )
+        .await
+    }
+}
+
+pub struct G2Transport;
+
+#[async_trait]
+impl Transport for G2Transport {
+    async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::G2 {
+            bail!(
+                "g2 transport requires g2:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let tls_acceptor = build_server_tls_acceptor(endpoint)?;
+        let bind_addr = endpoint_socket_addr(endpoint)?;
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("failed to bind g2 listener on {bind_addr}"))?;
+        let (tcp_stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| format!("failed to accept first g2 client on {bind_addr}"))?;
+        let tls_stream = tls_acceptor
+            .accept(tcp_stream)
+            .await
+            .context("failed tls handshake for g2 listener")?;
+
+        accept_h2_tunnel(endpoint.path.as_deref().unwrap_or("/"), tls_stream, true).await
+    }
+
+    async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::G2 {
+            bail!(
+                "g2 transport requires g2:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let remote_addr = endpoint_socket_addr(endpoint)?;
+        let tcp_stream = TcpStream::connect(remote_addr)
+            .await
+            .with_context(|| format!("failed to connect g2 tcp stream to {remote_addr}"))?;
+        let tls_stream = connect_tls_stream(endpoint, tcp_stream).await?;
+
+        connect_h2_tunnel(
+            endpoint.path.as_deref().unwrap_or("/"),
+            endpoint,
+            tls_stream,
+            true,
+        )
+        .await
+    }
+}
+
 pub struct UdpRawTransport;
 
 #[async_trait]
@@ -527,6 +633,250 @@ fn build_client_crypto_config(endpoint: &TransportEndpoint) -> Result<ClientConf
     Ok(ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth())
+}
+
+async fn accept_h2_tunnel<S>(path: &str, io_stream: S, grpc_mode: bool) -> Result<Connection>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut h2 = h2::server::handshake(io_stream)
+        .await
+        .context("failed h2 server handshake")?;
+
+    let (request, mut respond) = h2
+        .accept()
+        .await
+        .ok_or_else(|| anyhow!("h2 server closed before first request"))
+        .and_then(|r| r.context("failed to accept h2 request"))?;
+
+    if request.uri().path() != path {
+        bail!(
+            "unexpected h2 path '{}', expected '{}'",
+            request.uri().path(),
+            path
+        );
+    }
+
+    let (local_end, bridge_end) = io::duplex(64 * 1024);
+    let (mut bridge_reader, mut bridge_writer) = io::split(bridge_end);
+
+    let mut req_body = request.into_body();
+    let mut send_stream = respond
+        .send_response(
+            http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("h2 response"),
+            false,
+        )
+        .context("failed to send h2 response headers")?;
+
+    tokio::spawn(async move {
+        let mut grpc_decoder = GrpcFrameDecoder::default();
+        while let Some(chunk_result) = req_body.data().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+
+            if grpc_mode {
+                for frame in grpc_decoder.feed(&chunk) {
+                    if bridge_writer.write_all(&frame).await.is_err() {
+                        return;
+                    }
+                }
+                if bridge_writer.flush().await.is_err() {
+                    return;
+                }
+            } else {
+                if bridge_writer.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                if bridge_writer.flush().await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        let _ = bridge_writer.shutdown().await;
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let size = match bridge_reader.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if size == 0 {
+                let _ = send_stream.send_data(Bytes::new(), true);
+                break;
+            }
+
+            if grpc_mode {
+                let frame = grpc_frame_encode(&buf[..size]);
+                if send_stream.send_data(frame, false).is_err() {
+                    break;
+                }
+            } else if send_stream
+                .send_data(Bytes::copy_from_slice(&buf[..size]), false)
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    tokio::spawn(async move { while let Some(_event) = h2.accept().await {} });
+
+    Ok(Connection::Stream(Box::new(local_end)))
+}
+
+async fn connect_h2_tunnel<S>(
+    path: &str,
+    endpoint: &TransportEndpoint,
+    io_stream: S,
+    grpc_mode: bool,
+) -> Result<Connection>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, connection) = h2::client::handshake(io_stream)
+        .await
+        .context("failed h2 client handshake")?;
+
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let authority = format!("{}:{}", endpoint.host, endpoint.port);
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", authority)
+        .body(())
+        .expect("h2 request");
+
+    if grpc_mode {
+        request
+            .headers_mut()
+            .insert("content-type", "application/grpc".parse().expect("ct"));
+        request
+            .headers_mut()
+            .insert("te", "trailers".parse().expect("te"));
+    }
+
+    let (response_fut, mut req_send) = sender
+        .send_request(request, false)
+        .context("failed to send h2 request headers")?;
+    let response = response_fut
+        .await
+        .context("failed to receive h2 response")?;
+    let mut res_body = response.into_body();
+
+    let (local_end, bridge_end) = io::duplex(64 * 1024);
+    let (mut bridge_reader, mut bridge_writer) = io::split(bridge_end);
+
+    tokio::spawn(async move {
+        let mut grpc_decoder = GrpcFrameDecoder::default();
+        while let Some(chunk_result) = res_body.data().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+
+            if grpc_mode {
+                for frame in grpc_decoder.feed(&chunk) {
+                    if bridge_writer.write_all(&frame).await.is_err() {
+                        return;
+                    }
+                }
+                if bridge_writer.flush().await.is_err() {
+                    return;
+                }
+            } else {
+                if bridge_writer.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                if bridge_writer.flush().await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        let _ = bridge_writer.shutdown().await;
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let size = match bridge_reader.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if size == 0 {
+                let _ = req_send.send_data(Bytes::new(), true);
+                break;
+            }
+
+            if grpc_mode {
+                let frame = grpc_frame_encode(&buf[..size]);
+                if req_send.send_data(frame, false).is_err() {
+                    break;
+                }
+            } else if req_send
+                .send_data(Bytes::copy_from_slice(&buf[..size]), false)
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    Ok(Connection::Stream(Box::new(local_end)))
+}
+
+fn grpc_frame_encode(payload: &[u8]) -> Bytes {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    Bytes::from(frame)
+}
+
+#[derive(Default)]
+struct GrpcFrameDecoder {
+    buffer: Vec<u8>,
+}
+
+impl GrpcFrameDecoder {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        self.buffer.extend_from_slice(chunk);
+        let mut out = Vec::new();
+
+        loop {
+            if self.buffer.len() < 5 {
+                break;
+            }
+
+            let len = u32::from_be_bytes([
+                self.buffer[1],
+                self.buffer[2],
+                self.buffer[3],
+                self.buffer[4],
+            ]) as usize;
+
+            if self.buffer.len() < 5 + len {
+                break;
+            }
+
+            let payload = self.buffer[5..5 + len].to_vec();
+            self.buffer.drain(0..5 + len);
+            out.push(payload);
+        }
+
+        out
+    }
 }
 
 fn websocket_client_request(
@@ -841,8 +1191,8 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 #[cfg(test)]
 mod tests {
     use super::{
-        Connection, QuicTransport, TcpRawTransport, TlsTransport, Transport, TransportEndpoint,
-        UdpRawTransport, WsTransport, WssTransport,
+        Connection, G2Transport, H2Transport, QuicTransport, TcpRawTransport, TlsTransport,
+        Transport, TransportEndpoint, UdpRawTransport, WsTransport, WssTransport,
     };
     use anyhow::Result;
     use std::fs;
@@ -1083,6 +1433,150 @@ mod tests {
         let mut stream = match conn {
             Connection::Stream(stream) => stream,
             Connection::Datagram(_) => panic!("quic must return stream"),
+        };
+
+        stream.write_all(b"hello").await?;
+        let mut out = [0u8; 5];
+        stream.read_exact(&mut out).await?;
+        assert_eq!(&out, b"world");
+
+        server_task.await?;
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn h2_transport_e2e_tunnel() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!(
+            "dsn-h2-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp)?;
+
+        let ca = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert_pem = ca.cert.pem();
+        let key_pem = ca.key_pair.serialize_pem();
+
+        let cert_path = tmp.join("server-cert.pem");
+        let key_path = tmp.join("server-key.pem");
+        let ca_path = tmp.join("ca.pem");
+        fs::write(&cert_path, &cert_pem)?;
+        fs::write(&key_path, &key_pem)?;
+        fs::write(&ca_path, &cert_pem)?;
+
+        let probe = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+
+        let listen_endpoint = TransportEndpoint::from_str(&format!(
+            "h2://127.0.0.1:{}/tunnel?cert={}&key={}",
+            addr.port(),
+            cert_path.display(),
+            key_path.display()
+        ))?;
+
+        let connect_endpoint = TransportEndpoint::from_str(&format!(
+            "h2://127.0.0.1:{}/tunnel?ca={}&servername=localhost",
+            addr.port(),
+            ca_path.display()
+        ))?;
+
+        let server_task = tokio::spawn(async move {
+            let transport = H2Transport;
+            let conn = transport.listen(&listen_endpoint).await.expect("listen h2");
+            let mut stream = match conn {
+                Connection::Stream(stream) => stream,
+                Connection::Datagram(_) => panic!("h2 must return stream"),
+            };
+
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await.expect("read h2 payload");
+            assert_eq!(&buf, b"hello");
+            stream.write_all(b"world").await.expect("write h2 payload");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let transport = H2Transport;
+        let conn = transport.connect(&connect_endpoint).await?;
+        let mut stream = match conn {
+            Connection::Stream(stream) => stream,
+            Connection::Datagram(_) => panic!("h2 must return stream"),
+        };
+
+        stream.write_all(b"hello").await?;
+        let mut out = [0u8; 5];
+        stream.read_exact(&mut out).await?;
+        assert_eq!(&out, b"world");
+
+        server_task.await?;
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn g2_transport_e2e_tunnel() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!(
+            "dsn-g2-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp)?;
+
+        let ca = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert_pem = ca.cert.pem();
+        let key_pem = ca.key_pair.serialize_pem();
+
+        let cert_path = tmp.join("server-cert.pem");
+        let key_path = tmp.join("server-key.pem");
+        let ca_path = tmp.join("ca.pem");
+        fs::write(&cert_path, &cert_pem)?;
+        fs::write(&key_path, &key_pem)?;
+        fs::write(&ca_path, &cert_pem)?;
+
+        let probe = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+
+        let listen_endpoint = TransportEndpoint::from_str(&format!(
+            "g2://127.0.0.1:{}/tunnel.Tunnel/Stream?cert={}&key={}",
+            addr.port(),
+            cert_path.display(),
+            key_path.display()
+        ))?;
+
+        let connect_endpoint = TransportEndpoint::from_str(&format!(
+            "g2://127.0.0.1:{}/tunnel.Tunnel/Stream?ca={}&servername=localhost",
+            addr.port(),
+            ca_path.display()
+        ))?;
+
+        let server_task = tokio::spawn(async move {
+            let transport = G2Transport;
+            let conn = transport.listen(&listen_endpoint).await.expect("listen g2");
+            let mut stream = match conn {
+                Connection::Stream(stream) => stream,
+                Connection::Datagram(_) => panic!("g2 must return stream"),
+            };
+
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await.expect("read g2 payload");
+            assert_eq!(&buf, b"hello");
+            stream.write_all(b"world").await.expect("write g2 payload");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let transport = G2Transport;
+        let conn = transport.connect(&connect_endpoint).await?;
+        let mut stream = match conn {
+            Connection::Stream(stream) => stream,
+            Connection::Datagram(_) => panic!("g2 must return stream"),
         };
 
         stream.write_all(b"hello").await?;
