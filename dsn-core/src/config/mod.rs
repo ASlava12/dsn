@@ -22,6 +22,8 @@ const ENV_PREFIX: &str = "DSN";
 pub struct DsnConfig {
     #[serde(default)]
     pub participate_in_dht: bool,
+    #[serde(default)]
+    pub allow_insecure: bool,
     pub identity: IdentityConfig,
 }
 
@@ -37,6 +39,7 @@ impl DsnConfig {
     pub fn default_with_generated_identity() -> Result<Self> {
         Ok(Self {
             participate_in_dht: false,
+            allow_insecure: false,
             identity: generate_identity("ed25519")?,
         })
     }

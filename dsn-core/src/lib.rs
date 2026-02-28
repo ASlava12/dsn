@@ -1,5 +1,6 @@
 pub mod config;
 pub mod identity;
+pub mod transport;
 
 pub use config::format::ConfigFormat;
 pub use config::paths::{LocatedConfig, default_config_path, locate_configs, resolve_config_path};
@@ -9,3 +10,7 @@ pub use config::{
     save_config_value, validate_config,
 };
 pub use identity::generate_identity;
+
+pub use transport::{
+    TransportEndpoint, TransportParam, TransportScheme, parse_bool_param, reserved_transport_params,
+};
