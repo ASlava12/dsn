@@ -147,6 +147,10 @@ impl FromStr for TransportEndpoint {
             .map(ToOwned::to_owned)
             .ok_or_else(|| anyhow!("transport endpoint host is missing"))?;
 
+        if !has_explicit_port(s) {
+            bail!("transport endpoint must include explicit port");
+        }
+
         let port = parsed
             .port_or_known_default()
             .ok_or_else(|| anyhow!("transport endpoint must include explicit port"))?;
@@ -180,6 +184,27 @@ impl FromStr for TransportEndpoint {
             params,
         })
     }
+}
+
+fn has_explicit_port(input: &str) -> bool {
+    let Some((_, remainder)) = input.split_once("://") else {
+        return false;
+    };
+
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+
+    if authority.starts_with('[') {
+        let Some((_, port)) = authority.rsplit_once("]:") else {
+            return false;
+        };
+        return !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit());
+    }
+
+    let Some((_, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+
+    !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -229,6 +254,13 @@ mod tests {
     fn rejects_endpoint_without_port() {
         let err = TransportEndpoint::from_str("tls://10.0.0.1")
             .expect_err("missing explicit port must fail");
+        assert!(err.to_string().contains("explicit port"));
+    }
+
+    #[test]
+    fn rejects_wss_endpoint_with_implicit_default_port() {
+        let err = TransportEndpoint::from_str("wss://example.com/path")
+            .expect_err("missing explicit wss port must fail");
         assert!(err.to_string().contains("explicit port"));
     }
 
