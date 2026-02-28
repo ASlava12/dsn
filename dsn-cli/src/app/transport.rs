@@ -1,19 +1,16 @@
 use anyhow::{Context, Result, bail};
-use dsn_core::{DsnConfig, TransportEndpoint, TransportScheme, load_config, resolve_config_path};
-use std::net::SocketAddr;
+use dsn_core::{
+    Connection, DatagramConn, DsnConfig, TransportEndpoint, TransportScheme, load_config,
+    resolve_config_path, transport_for_scheme,
+};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{
-    self, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader,
-};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::cmd::cli::TransportCommands;
 
-pub async fn handle(
-    command: TransportCommands,
-    explicit_config: Option<std::path::PathBuf>,
-) -> Result<()> {
+pub async fn handle(command: TransportCommands, explicit_config: Option<PathBuf>) -> Result<()> {
     let _cfg = load_runtime_config(explicit_config.as_deref())?;
 
     match command {
@@ -28,7 +25,7 @@ pub async fn handle(
     }
 }
 
-fn load_runtime_config(explicit_config: Option<&std::path::Path>) -> Result<Option<DsnConfig>> {
+fn load_runtime_config(explicit_config: Option<&Path>) -> Result<Option<DsnConfig>> {
     let path = resolve_config_path(explicit_config)?;
     if !path.exists() {
         return Ok(None);
@@ -42,97 +39,61 @@ fn parse_transport_endpoint(raw: &str) -> Result<TransportEndpoint> {
 }
 
 async fn run_listen(endpoint: TransportEndpoint) -> Result<()> {
-    match endpoint.scheme {
-        TransportScheme::Tcp => run_tcp_listen(endpoint).await,
-        TransportScheme::Udp => run_udp_listen(endpoint).await,
-        scheme => {
-            bail!("transport listen is currently implemented only for tcp/udp, got '{scheme}'")
+    let transport = transport_for_scheme(endpoint.scheme)?;
+    let connection = transport.listen(&endpoint).await?;
+
+    match connection {
+        Connection::Stream(stream) => pipe_stream_with_io(stream, io::stdin(), io::stdout()).await,
+        Connection::Datagram(datagram) => {
+            if endpoint.scheme != TransportScheme::Udp {
+                bail!("listen datagram mode is currently supported only for udp");
+            }
+            run_udp_listen_pipe(datagram).await
         }
     }
 }
 
 async fn run_connect(endpoint: TransportEndpoint) -> Result<()> {
-    match endpoint.scheme {
-        TransportScheme::Tcp => run_tcp_connect(endpoint).await,
-        TransportScheme::Udp => run_udp_connect(endpoint).await,
-        scheme => {
-            bail!("transport connect is currently implemented only for tcp/udp, got '{scheme}'")
+    let transport = transport_for_scheme(endpoint.scheme)?;
+    let connection = transport.connect(&endpoint).await?;
+
+    match connection {
+        Connection::Stream(stream) => pipe_stream_with_io(stream, io::stdin(), io::stdout()).await,
+        Connection::Datagram(datagram) => {
+            if endpoint.scheme != TransportScheme::Udp {
+                bail!("connect datagram mode is currently supported only for udp");
+            }
+            pipe_udp_connected_with_io(Arc::from(datagram), io::stdin(), io::stdout(), None).await
         }
     }
 }
 
-async fn run_tcp_listen(endpoint: TransportEndpoint) -> Result<()> {
-    let bind_addr = endpoint_socket_addr(&endpoint)?;
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("failed to bind tcp listener on {bind_addr}"))?;
-
-    let (stream, _) = listener
-        .accept()
-        .await
-        .with_context(|| format!("failed to accept first tcp client on {bind_addr}"))?;
-
-    pipe_tcp_with_io(stream, io::stdin(), io::stdout()).await
-}
-
-async fn run_tcp_connect(endpoint: TransportEndpoint) -> Result<()> {
-    let remote_addr = endpoint_socket_addr(&endpoint)?;
-    let stream = TcpStream::connect(remote_addr)
-        .await
-        .with_context(|| format!("failed to connect tcp stream to {remote_addr}"))?;
-
-    pipe_tcp_with_io(stream, io::stdin(), io::stdout()).await
-}
-
-async fn run_udp_listen(endpoint: TransportEndpoint) -> Result<()> {
-    let bind_addr = endpoint_socket_addr(&endpoint)?;
-    let socket = Arc::new(
-        UdpSocket::bind(bind_addr)
-            .await
-            .with_context(|| format!("failed to bind udp listener on {bind_addr}"))?,
-    );
-
+async fn run_udp_listen_pipe(datagram: Box<dyn DatagramConn>) -> Result<()> {
     let mut first_buf = vec![0u8; 64 * 1024];
-    let (size, peer_addr) = socket
-        .recv_from(&mut first_buf)
+    let (size, peer_addr) = datagram
+        .recv(&mut first_buf)
         .await
-        .with_context(|| format!("failed to receive first udp datagram on {bind_addr}"))?;
+        .context("failed to receive first udp datagram")?;
     let first_payload = first_buf[..size].to_vec();
 
-    pipe_udp_listen_with_io(
-        socket,
-        peer_addr,
-        Some(first_payload),
+    datagram
+        .connect(peer_addr)
+        .await
+        .with_context(|| format!("failed to lock udp listener to first peer {peer_addr}"))?;
+
+    pipe_udp_connected_with_io(
+        Arc::from(datagram),
         io::stdin(),
         io::stdout(),
+        Some(first_payload),
     )
     .await
+    .with_context(|| "failed udp listen pipe after first peer lock")
 }
 
-async fn run_udp_connect(endpoint: TransportEndpoint) -> Result<()> {
-    let remote_addr = endpoint_socket_addr(&endpoint)?;
-    let socket = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .context("failed to bind udp client socket")?,
-    );
-    socket
-        .connect(remote_addr)
-        .await
-        .with_context(|| format!("failed to connect udp socket to {remote_addr}"))?;
-
-    pipe_udp_connected_with_io(socket, io::stdin(), io::stdout()).await
-}
-
-fn endpoint_socket_addr(endpoint: &TransportEndpoint) -> Result<SocketAddr> {
-    let addr = format!("{}:{}", endpoint.host, endpoint.port);
-    addr.parse()
-        .with_context(|| format!("host must be an IP address for now: {}", endpoint.host))
-}
-
-async fn pipe_tcp_with_io<S, I, O>(stream: S, stdin: I, stdout: O) -> Result<()>
+async fn pipe_stream_with_io<S, I, O>(stream: S, stdin: I, stdout: O) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     I: AsyncRead + Unpin,
     O: AsyncWrite + Unpin,
 {
@@ -170,62 +131,31 @@ where
     Ok(())
 }
 
-async fn pipe_udp_listen_with_io<I, O>(
-    socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
-    initial_payload: Option<Vec<u8>>,
+async fn pipe_udp_connected_with_io<I, O>(
+    conn: Arc<dyn DatagramConn>,
     stdin: I,
     stdout: O,
+    initial_payload: Option<Vec<u8>>,
 ) -> Result<()>
 where
     I: AsyncRead + Unpin,
     O: AsyncWrite + Unpin,
 {
-    let mut recv_stdout = Box::pin(recv_udp_from_peer(
-        socket.clone(),
-        peer_addr,
-        initial_payload,
-        stdout,
-    ));
-    let mut send_stdin = Box::pin(send_lines_to_udp_peer(socket, peer_addr, stdin));
+    let mut recv_stdout = Box::pin(recv_udp_connected(conn.clone(), stdout, initial_payload));
+    let mut send_stdin = Box::pin(send_lines_to_udp_connected(conn, stdin));
 
     tokio::select! {
-        r = &mut recv_stdout => {
-            r?;
-        }
-        r = &mut send_stdin => {
-            r?;
-        }
+        r = &mut recv_stdout => r?,
+        r = &mut send_stdin => r?,
     }
 
     Ok(())
 }
 
-async fn pipe_udp_connected_with_io<I, O>(socket: Arc<UdpSocket>, stdin: I, stdout: O) -> Result<()>
-where
-    I: AsyncRead + Unpin,
-    O: AsyncWrite + Unpin,
-{
-    let mut recv_stdout = Box::pin(recv_udp_connected(socket.clone(), stdout));
-    let mut send_stdin = Box::pin(send_lines_to_udp_connected(socket, stdin));
-
-    tokio::select! {
-        r = &mut recv_stdout => {
-            r?;
-        }
-        r = &mut send_stdin => {
-            r?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn recv_udp_from_peer<O>(
-    socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
-    initial_payload: Option<Vec<u8>>,
+async fn recv_udp_connected<O>(
+    conn: Arc<dyn DatagramConn>,
     mut stdout: O,
+    initial_payload: Option<Vec<u8>>,
 ) -> Result<()>
 where
     O: AsyncWrite + Unpin,
@@ -240,55 +170,10 @@ where
 
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let (size, addr) = socket
-            .recv_from(&mut buf)
-            .await
-            .context("failed to receive udp datagram")?;
-        if addr != peer_addr {
-            continue;
-        }
-
-        stdout
-            .write_all(&buf[..size])
-            .await
-            .context("failed to write udp payload to stdout")?;
-        stdout.flush().await.context("failed to flush stdout")?;
-    }
-}
-
-async fn send_lines_to_udp_peer<I>(
-    socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
-    stdin: I,
-) -> Result<()>
-where
-    I: AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stdin).lines();
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .context("failed to read line from stdin")?
-    {
-        socket
-            .send_to(line.as_bytes(), peer_addr)
-            .await
-            .context("failed to send udp datagram")?;
-    }
-
-    Ok(())
-}
-
-async fn recv_udp_connected<O>(socket: Arc<UdpSocket>, mut stdout: O) -> Result<()>
-where
-    O: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let size = socket
+        let (size, _) = conn
             .recv(&mut buf)
             .await
-            .context("failed to receive connected udp datagram")?;
+            .context("failed to receive udp datagram")?;
         stdout
             .write_all(&buf[..size])
             .await
@@ -297,7 +182,7 @@ where
     }
 }
 
-async fn send_lines_to_udp_connected<I>(socket: Arc<UdpSocket>, stdin: I) -> Result<()>
+async fn send_lines_to_udp_connected<I>(conn: Arc<dyn DatagramConn>, stdin: I) -> Result<()>
 where
     I: AsyncRead + Unpin,
 {
@@ -307,8 +192,7 @@ where
         .await
         .context("failed to read line from stdin")?
     {
-        socket
-            .send(line.as_bytes())
+        conn.send(line.as_bytes(), None)
             .await
             .context("failed to send connected udp datagram")?;
     }
@@ -318,8 +202,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{pipe_tcp_with_io, pipe_udp_connected_with_io};
+    use super::{pipe_stream_with_io, pipe_udp_connected_with_io};
     use anyhow::Result;
+    use dsn_core::{Connection, DatagramConn, Transport, TransportEndpoint, UdpRawTransport};
+    use std::str::FromStr;
     use std::sync::Arc;
     use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -354,7 +240,7 @@ mod tests {
 
         timeout(
             Duration::from_secs(3),
-            pipe_tcp_with_io(client_stream, stdin_rx, stdout_tx),
+            pipe_stream_with_io(client_stream, stdin_rx, stdout_tx),
         )
         .await??;
 
@@ -371,8 +257,13 @@ mod tests {
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let server_addr = server.local_addr()?;
 
-        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-        client.connect(server_addr).await?;
+        let endpoint = TransportEndpoint::from_str(&format!("udp://{}", server_addr))?;
+        let transport = UdpRawTransport;
+        let conn = transport.connect(&endpoint).await?;
+        let datagram: Arc<dyn DatagramConn> = match conn {
+            Connection::Datagram(datagram) => Arc::from(datagram),
+            Connection::Stream(_) => panic!("udp transport must return datagram connection"),
+        };
 
         let server_task = {
             let server = server.clone();
@@ -391,7 +282,9 @@ mod tests {
         let (mut stdin_tx, stdin_rx) = io::duplex(128);
         let (stdout_tx, mut stdout_rx) = io::duplex(128);
 
-        let pipe_task = tokio::spawn(pipe_udp_connected_with_io(client, stdin_rx, stdout_tx));
+        let pipe_task = tokio::spawn(pipe_udp_connected_with_io(
+            datagram, stdin_rx, stdout_tx, None,
+        ));
 
         stdin_tx.write_all(b"line-1\nline-2\n").await?;
         tokio::time::sleep(Duration::from_millis(100)).await;

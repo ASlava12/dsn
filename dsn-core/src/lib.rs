@@ -12,5 +12,7 @@ pub use config::{
 pub use identity::generate_identity;
 
 pub use transport::{
-    TransportEndpoint, TransportParam, TransportScheme, parse_bool_param, reserved_transport_params,
+    AsyncReadWrite, BoxedStreamConn, Connection, DatagramConn, TcpRawTransport, Transport,
+    TransportEndpoint, TransportParam, TransportScheme, UdpRawTransport, endpoint_socket_addr,
+    parse_bool_param, reserved_transport_params, transport_for_scheme,
 };
