@@ -1,1 +1,1 @@
-pub mod helpers;
+//! Reserved for future shared CLI helpers.

@@ -4,5 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-config = { version = "0.15", features = ["toml", "yaml", "json", "ini"] }
+dsn-core = { path = "../dsn-core" }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

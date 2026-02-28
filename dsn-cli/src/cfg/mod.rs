@@ -1,1 +1,1 @@
-pub mod cfg;
+//! Reserved for future CLI-local config helpers.
