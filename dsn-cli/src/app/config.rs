@@ -32,7 +32,8 @@ pub async fn handle(command: ConfigCommands, explicit_config: Option<PathBuf>) -
         }
         ConfigCommands::Validate { path } => {
             let target = resolve_validation_path(path.as_deref(), explicit_config.as_deref())?;
-            validate_config(&target)?;
+            validate_config(&target)
+                .with_context(|| format!("config validation failed: {}", target.display()))?;
             println!("Config is valid: {}", target.display());
         }
         ConfigCommands::Keygen { key_type, output } => {

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use configparser::ini::Ini;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -48,9 +49,6 @@ impl DsnConfig {
             );
         }
 
-        validate_key_field("public_key", &self.identity.public_key)?;
-        validate_key_field("private_key", &self.identity.private_key)?;
-
         if self.identity.id.len() != 64 {
             bail!("identity.id must contain 64 hex characters (256 bits)");
         }
@@ -59,21 +57,49 @@ impl DsnConfig {
             bail!("identity.id must contain only hex characters");
         }
 
+        let public_key_bytes = decode_key_field("public_key", &self.identity.public_key)?;
+        let private_key_bytes = decode_key_field("private_key", &self.identity.private_key)?;
+
+        let public_key = parse_public_key(&public_key_bytes)?;
+        let signing_key = parse_private_key(&private_key_bytes)?;
+
+        let expected_id = blake3::hash(public_key.as_bytes())
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        if self.identity.id.to_ascii_lowercase() != expected_id {
+            bail!("identity.id does not match blake3(public_key)");
+        }
+
+        if signing_key.verifying_key() != public_key {
+            bail!("public_key does not match private_key");
+        }
+
+        let probe = b"dsn-config-signature-check";
+        let signature: Signature = signing_key.sign(probe);
+        public_key
+            .verify(probe, &signature)
+            .context("failed to verify test signature")?;
+
         Ok(())
     }
 }
 
 pub fn init_config(path: &Path) -> Result<DsnConfig> {
     ConfigFormat::from_path(path)?;
+    if path.exists() {
+        bail!("config already exists: {}", path.display());
+    }
+
     let cfg = DsnConfig::default_with_generated_identity()?;
     save_config(path, &cfg)?;
     Ok(cfg)
 }
 
 pub fn validate_config(path: &Path) -> Result<DsnConfig> {
-    let cfg = load_config(path)?;
-    cfg.validate()?;
-    Ok(cfg)
+    load_config(path)
 }
 
 pub fn regenerate_keys(path: &Path) -> Result<DsnConfig> {
@@ -104,7 +130,12 @@ pub fn load_config(path: &Path) -> Result<DsnConfig> {
 
     apply_env_overrides(&mut value)?;
 
-    serde_json::from_value(value).context("failed to deserialize config into dsn schema")
+    let cfg: DsnConfig =
+        serde_json::from_value(value).context("failed to deserialize config into dsn schema")?;
+    cfg.validate()
+        .with_context(|| format!("invalid config {}", path.display()))?;
+
+    Ok(cfg)
 }
 
 pub fn save_config(path: &Path, cfg: &DsnConfig) -> Result<()> {
@@ -137,17 +168,43 @@ pub fn save_config_value(path: &Path, value: Value) -> Result<()> {
     fs::write(path, output).with_context(|| format!("failed to write config {}", path.display()))
 }
 
-fn validate_key_field(name: &str, value: &str) -> Result<()> {
+fn decode_key_field(name: &str, value: &str) -> Result<Vec<u8>> {
     let as_path = PathBuf::from(value);
     if as_path.exists() {
-        return Ok(());
+        return fs::read(&as_path)
+            .with_context(|| format!("failed to read {name} from {}", as_path.display()));
     }
 
     base64::engine::general_purpose::STANDARD
         .decode(value)
-        .with_context(|| format!("{name} must be base64 or an existing file path"))?;
+        .with_context(|| format!("{name} must be base64 or an existing file path"))
+}
 
-    Ok(())
+fn parse_public_key(raw: &[u8]) -> Result<VerifyingKey> {
+    let bytes: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| anyhow!("public_key must decode to 32 bytes for ed25519"))?;
+
+    VerifyingKey::from_bytes(&bytes).context("public_key is not a valid ed25519 key")
+}
+
+fn parse_private_key(raw: &[u8]) -> Result<SigningKey> {
+    match raw.len() {
+        32 => {
+            let bytes: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| anyhow!("private_key must decode to 32 or 64 bytes for ed25519"))?;
+            Ok(SigningKey::from_bytes(&bytes))
+        }
+        64 => {
+            let bytes: [u8; 64] = raw
+                .try_into()
+                .map_err(|_| anyhow!("private_key must decode to 32 or 64 bytes for ed25519"))?;
+            SigningKey::from_keypair_bytes(&bytes)
+                .map_err(|err| anyhow!("private_key is not a valid ed25519 keypair: {err}"))
+        }
+        _ => bail!("private_key must decode to 32 or 64 bytes for ed25519"),
+    }
 }
 
 fn parse_ini_to_value(content: &str) -> Result<Value> {
@@ -244,4 +301,53 @@ fn apply_env_overrides(value: &mut Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DsnConfig, init_config};
+    use crate::identity::generate_identity;
+    use std::fs;
+
+    #[test]
+    fn init_config_does_not_overwrite_existing_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dsn-init-test-{}-{unique}", std::process::id()));
+        let _ = fs::create_dir_all(&base);
+        let path = base.join("config.toml");
+        fs::write(&path, "[identity]\nid=\"old\"\n").expect("seed config");
+
+        let err = init_config(&path).expect_err("init should fail when config exists");
+        assert!(err.to_string().contains("config already exists"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_checks_identity_binding() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.validate().expect("generated config should validate");
+
+        cfg.identity.id = "0".repeat(64);
+        let err = cfg.validate().expect_err("tampered id should fail");
+        assert!(err.to_string().contains("identity.id does not match"));
+    }
+
+    #[test]
+    fn validate_checks_signature() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        let other = generate_identity("ed25519").expect("other identity");
+        cfg.identity.private_key = other.private_key;
+
+        let err = cfg.validate().expect_err("mismatched keys must fail");
+        assert!(
+            err.to_string()
+                .contains("public_key does not match private_key")
+        );
+    }
 }
