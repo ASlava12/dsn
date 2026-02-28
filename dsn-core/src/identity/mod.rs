@@ -18,12 +18,9 @@ pub fn generate_identity(algo: &str) -> Result<IdentityConfig> {
     let private_key =
         base64::engine::general_purpose::STANDARD.encode(signing_key.to_keypair_bytes().as_ref());
 
-    let mut hash_output = [0_u8; 128];
-    blake3::Hasher::new()
-        .update(verifying_key.as_bytes())
-        .finalize_xof()
-        .fill(&mut hash_output);
+    let hash_output = blake3::hash(verifying_key.as_bytes());
     let id = hash_output
+        .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
@@ -34,4 +31,17 @@ pub fn generate_identity(algo: &str) -> Result<IdentityConfig> {
         private_key,
         id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_identity;
+
+    #[test]
+    fn generated_identity_id_is_256_bit_hex() {
+        let identity = generate_identity("ed25519").expect("identity generation must succeed");
+
+        assert_eq!(identity.id.len(), 64);
+        assert!(identity.id.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
 }

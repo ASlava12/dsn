@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use dsn_core::{
-    DsnConfig, generate_identity, get_from_value, init_config, load_config, locate_configs,
-    remove_in_value, resolve_config_path, save_config, save_config_value, set_in_value,
-    validate_config,
+    DsnConfig, fix_config, generate_identity, get_from_value, init_config, load_config,
+    locate_configs, remove_in_value, resolve_config_path, save_config, save_config_value,
+    set_in_value, validate_config,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -31,9 +31,20 @@ pub async fn handle(command: ConfigCommands, explicit_config: Option<PathBuf>) -
             println!("identity.id={}", cfg.identity.id);
         }
         ConfigCommands::Validate { path } => {
-            let target = pick_target_path(path.as_deref(), explicit_config.as_deref());
-            validate_config(&target)?;
+            let target = resolve_validation_path(path.as_deref(), explicit_config.as_deref())?;
+            validate_config(&target)
+                .with_context(|| format!("config validation failed: {}", target.display()))?;
             println!("Config is valid: {}", target.display());
+        }
+        ConfigCommands::Fix { path } => {
+            let target = resolve_validation_path(path.as_deref(), explicit_config.as_deref())?;
+            let fixed = fix_config(&target)
+                .with_context(|| format!("config fix failed: {}", target.display()))?;
+            if fixed {
+                println!("Config was fixed: {}", target.display());
+            } else {
+                println!("Config is already valid: {}", target.display());
+            }
         }
         ConfigCommands::Keygen { key_type, output } => {
             let identity = generate_identity(&key_type)?;
@@ -101,6 +112,14 @@ fn pick_target_path(path: Option<&Path>, explicit: Option<&Path>) -> PathBuf {
     }
 }
 
+fn resolve_validation_path(path: Option<&Path>, explicit: Option<&Path>) -> Result<PathBuf> {
+    match (path, explicit) {
+        (Some(path), _) => Ok(path.to_path_buf()),
+        (None, Some(path)) => Ok(path.to_path_buf()),
+        (None, None) => resolve_config_path(None),
+    }
+}
+
 fn load_or_init_json(path: &Path) -> Result<Value> {
     if path.exists() {
         return serde_json::to_value(load_config(path)?).context("failed to load existing config");
@@ -122,4 +141,29 @@ fn persist_with_validation(path: &Path, raw: Value, force: bool) -> Result<()> {
 
 fn parse_cli_value(value: &str) -> Value {
     serde_json::from_str::<Value>(value).unwrap_or_else(|_| Value::String(value.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_validation_path;
+    use std::path::Path;
+
+    #[test]
+    fn validate_prefers_command_path_over_global() {
+        let path = resolve_validation_path(
+            Some(Path::new("/tmp/from-command.toml")),
+            Some(Path::new("/tmp/from-global.toml")),
+        )
+        .expect("path should resolve");
+
+        assert_eq!(path, Path::new("/tmp/from-command.toml"));
+    }
+
+    #[test]
+    fn validate_uses_global_path_when_command_path_absent() {
+        let path = resolve_validation_path(None, Some(Path::new("/tmp/from-global.toml")))
+            .expect("path should resolve");
+
+        assert_eq!(path, Path::new("/tmp/from-global.toml"));
+    }
 }
