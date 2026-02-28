@@ -14,6 +14,19 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Config(ConfigArgs),
+    Transport(TransportArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct TransportArgs {
+    #[command(subcommand)]
+    pub command: TransportCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TransportCommands {
+    Listen { transport: String },
+    Connect { transport: String },
 }
 
 #[derive(Parser, Debug)]
