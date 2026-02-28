@@ -63,11 +63,7 @@ impl DsnConfig {
         let public_key = parse_public_key(&public_key_bytes)?;
         let signing_key = parse_private_key(&private_key_bytes)?;
 
-        let expected_id = blake3::hash(public_key.as_bytes())
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let expected_id = expected_identity_id(&self.identity.public_key)?;
 
         if self.identity.id.to_ascii_lowercase() != expected_id {
             bail!("identity.id does not match blake3(public_key)");
@@ -102,6 +98,36 @@ pub fn validate_config(path: &Path) -> Result<DsnConfig> {
     load_config(path)
 }
 
+pub fn fix_config(path: &Path) -> Result<bool> {
+    let mut cfg = load_config_unvalidated(path)?;
+
+    if cfg.validate().is_ok() {
+        return Ok(false);
+    }
+
+    let expected_id = expected_identity_id(&cfg.identity.public_key)
+        .context("unable to repair identity.id from public_key")?;
+
+    if cfg.identity.id == expected_id {
+        cfg.validate()
+            .with_context(|| format!("invalid config {}", path.display()))?;
+        return Ok(false);
+    }
+
+    cfg.identity.id = expected_id;
+    cfg.validate().with_context(|| {
+        format!(
+            "config remains invalid after automatic fix {}",
+            path.display()
+        )
+    })?;
+
+    save_config(path, &cfg)
+        .with_context(|| format!("failed to persist fixed config {}", path.display()))?;
+
+    Ok(true)
+}
+
 pub fn regenerate_keys(path: &Path) -> Result<DsnConfig> {
     let mut cfg = load_config(path)?;
     cfg.identity = generate_identity("ed25519")?;
@@ -111,6 +137,14 @@ pub fn regenerate_keys(path: &Path) -> Result<DsnConfig> {
 }
 
 pub fn load_config(path: &Path) -> Result<DsnConfig> {
+    let cfg = load_config_unvalidated(path)?;
+    cfg.validate()
+        .with_context(|| format!("invalid config {}", path.display()))?;
+
+    Ok(cfg)
+}
+
+fn load_config_unvalidated(path: &Path) -> Result<DsnConfig> {
     let format = ConfigFormat::from_path(path)?;
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
@@ -130,12 +164,7 @@ pub fn load_config(path: &Path) -> Result<DsnConfig> {
 
     apply_env_overrides(&mut value)?;
 
-    let cfg: DsnConfig =
-        serde_json::from_value(value).context("failed to deserialize config into dsn schema")?;
-    cfg.validate()
-        .with_context(|| format!("invalid config {}", path.display()))?;
-
-    Ok(cfg)
+    serde_json::from_value(value).context("failed to deserialize config into dsn schema")
 }
 
 pub fn save_config(path: &Path, cfg: &DsnConfig) -> Result<()> {
@@ -205,6 +234,17 @@ fn parse_private_key(raw: &[u8]) -> Result<SigningKey> {
         }
         _ => bail!("private_key must decode to 32 or 64 bytes for ed25519"),
     }
+}
+
+fn expected_identity_id(public_key: &str) -> Result<String> {
+    let public_key_bytes = decode_key_field("public_key", public_key)?;
+    let public_key = parse_public_key(&public_key_bytes)?;
+
+    Ok(blake3::hash(public_key.as_bytes())
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
 }
 
 fn parse_ini_to_value(content: &str) -> Result<Value> {
@@ -305,7 +345,7 @@ fn apply_env_overrides(value: &mut Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DsnConfig, init_config};
+    use super::{DsnConfig, fix_config, init_config, load_config};
     use crate::identity::generate_identity;
     use std::fs;
 
@@ -336,6 +376,35 @@ mod tests {
         cfg.identity.id = "0".repeat(64);
         let err = cfg.validate().expect_err("tampered id should fail");
         assert!(err.to_string().contains("identity.id does not match"));
+    }
+
+    #[test]
+    fn fix_config_repairs_identity_id() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dsn-fix-test-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let path = base.join("config.json");
+
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.identity.id = "badid".to_owned();
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&cfg).expect("serialize"),
+        )
+        .expect("write config");
+
+        let fixed = fix_config(&path).expect("fix should succeed");
+        assert!(fixed, "config should be modified");
+
+        let loaded = load_config(&path).expect("fixed config should validate");
+        assert_eq!(loaded.identity.id.len(), 64);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

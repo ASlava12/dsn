@@ -31,6 +31,9 @@ pub enum ConfigCommands {
     Validate {
         path: Option<PathBuf>,
     },
+    Fix {
+        path: Option<PathBuf>,
+    },
     Keygen {
         #[arg(short = 't', long = "type", default_value = "ed25519")]
         key_type: String,

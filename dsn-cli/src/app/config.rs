@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use dsn_core::{
-    DsnConfig, generate_identity, get_from_value, init_config, load_config, locate_configs,
-    remove_in_value, resolve_config_path, save_config, save_config_value, set_in_value,
-    validate_config,
+    DsnConfig, fix_config, generate_identity, get_from_value, init_config, load_config,
+    locate_configs, remove_in_value, resolve_config_path, save_config, save_config_value,
+    set_in_value, validate_config,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,16 @@ pub async fn handle(command: ConfigCommands, explicit_config: Option<PathBuf>) -
             validate_config(&target)
                 .with_context(|| format!("config validation failed: {}", target.display()))?;
             println!("Config is valid: {}", target.display());
+        }
+        ConfigCommands::Fix { path } => {
+            let target = resolve_validation_path(path.as_deref(), explicit_config.as_deref())?;
+            let fixed = fix_config(&target)
+                .with_context(|| format!("config fix failed: {}", target.display()))?;
+            if fixed {
+                println!("Config was fixed: {}", target.display());
+            } else {
+                println!("Config is already valid: {}", target.display());
+            }
         }
         ConfigCommands::Keygen { key_type, output } => {
             let identity = generate_identity(&key_type)?;
