@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::identity::generate_identity;
+use crate::transport::{TransportEndpoint, TransportParam, TransportScheme};
 
 pub mod format;
 pub mod paths;
@@ -23,6 +24,12 @@ pub struct DsnConfig {
     #[serde(default)]
     pub participate_in_dht: bool,
     pub identity: IdentityConfig,
+
+    #[serde(default)]
+    pub bootstrap_peers: Vec<TransportEndpoint>,
+
+    #[serde(default)]
+    pub listen: Vec<TransportEndpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +45,8 @@ impl DsnConfig {
         Ok(Self {
             participate_in_dht: false,
             identity: generate_identity("ed25519")?,
+            bootstrap_peers: Vec::new(),
+            listen: Vec::new(),
         })
     }
 
@@ -79,8 +88,57 @@ impl DsnConfig {
             .verify(probe, &signature)
             .context("failed to verify test signature")?;
 
+        self.validate_transport_endpoints()?;
+
         Ok(())
     }
+
+    fn validate_transport_endpoints(&self) -> Result<()> {
+        for (index, endpoint) in self.bootstrap_peers.iter().enumerate() {
+            validate_transport_endpoint(endpoint)
+                .with_context(|| format!("bootstrap_peers[{index}] is invalid"))?;
+        }
+
+        for (index, endpoint) in self.listen.iter().enumerate() {
+            validate_transport_endpoint(endpoint)
+                .with_context(|| format!("listen[{index}] is invalid"))?;
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_transport_endpoint(endpoint: &TransportEndpoint) -> Result<()> {
+    if endpoint.scheme != TransportScheme::Unix && endpoint.port == 0 {
+        bail!("port must be greater than 0");
+    }
+
+    let needs_tls_assets = matches!(
+        endpoint.scheme,
+        TransportScheme::Tls
+            | TransportScheme::Wss
+            | TransportScheme::Quic
+            | TransportScheme::H2
+            | TransportScheme::G2
+    );
+
+    if !needs_tls_assets {
+        return Ok(());
+    }
+
+    for param in [
+        TransportParam::Ca.as_str(),
+        TransportParam::Cert.as_str(),
+        TransportParam::Key.as_str(),
+    ] {
+        if let Some(path) = endpoint.params.get(param)
+            && !Path::new(path).exists()
+        {
+            bail!("query param '{param}' points to missing path: {path}");
+        }
+    }
+
+    Ok(())
 }
 
 pub fn init_config(path: &Path) -> Result<DsnConfig> {
@@ -347,7 +405,9 @@ fn apply_env_overrides(value: &mut Value) -> Result<()> {
 mod tests {
     use super::{DsnConfig, fix_config, init_config, load_config};
     use crate::identity::generate_identity;
+    use crate::transport::TransportEndpoint;
     use std::fs;
+    use std::str::FromStr;
 
     #[test]
     fn init_config_does_not_overwrite_existing_file() {
@@ -418,5 +478,26 @@ mod tests {
             err.to_string()
                 .contains("public_key does not match private_key")
         );
+    }
+
+    #[test]
+    fn validate_accepts_empty_transport_lists() {
+        let cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.validate()
+            .expect("empty bootstrap_peers/listen must stay valid");
+    }
+
+    #[test]
+    fn validate_checks_tls_asset_paths_for_transport_lists() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.listen = vec![
+            TransportEndpoint::from_str(
+                "wss://127.0.0.1:443/path?cert=/definitely/missing/cert.pem",
+            )
+            .expect("endpoint parse"),
+        ];
+
+        let err = cfg.validate().expect_err("missing cert path must fail");
+        assert!(err.to_string().contains("listen[0] is invalid"));
     }
 }
