@@ -109,7 +109,7 @@ impl DsnConfig {
 }
 
 fn validate_transport_endpoint(endpoint: &TransportEndpoint) -> Result<()> {
-    if endpoint.port == 0 {
+    if endpoint.scheme != TransportScheme::Unix && endpoint.port == 0 {
         bail!("port must be greater than 0");
     }
 

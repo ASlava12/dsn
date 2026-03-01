@@ -6,6 +6,6 @@ pub use endpoint::{
 };
 pub use runtime::{
     AsyncReadWrite, BoxedStreamConn, Connection, DatagramConn, G2Transport, H2Transport,
-    QuicTransport, TcpRawTransport, TlsTransport, Transport, UdpRawTransport, WsTransport,
+    QuicTransport, TcpRawTransport, TlsTransport, Transport, UdpRawTransport, UnixTransport, WsTransport,
     WssTransport, endpoint_socket_addr, transport_for_scheme,
 };

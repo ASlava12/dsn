@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Once;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::Message;
@@ -445,6 +445,50 @@ impl Transport for G2Transport {
     }
 }
 
+pub struct UnixTransport;
+
+#[async_trait]
+impl Transport for UnixTransport {
+    async fn listen(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Unix {
+            bail!(
+                "unix transport requires unix:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let path = endpoint_unix_path(endpoint)?;
+        if std::path::Path::new(path).exists() {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("failed to bind unix listener on {path}"))?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| format!("failed to accept first unix client on {path}"))?;
+
+        Ok(Connection::Stream(Box::new(stream)))
+    }
+
+    async fn connect(&self, endpoint: &TransportEndpoint) -> Result<Connection> {
+        if endpoint.scheme != TransportScheme::Unix {
+            bail!(
+                "unix transport requires unix:// endpoint, got {}",
+                endpoint.scheme
+            );
+        }
+
+        let path = endpoint_unix_path(endpoint)?;
+        let stream = UnixStream::connect(path)
+            .await
+            .with_context(|| format!("failed to connect unix stream to {path}"))?;
+
+        Ok(Connection::Stream(Box::new(stream)))
+    }
+}
+
 pub struct UdpRawTransport;
 
 #[async_trait]
@@ -563,6 +607,18 @@ pub fn endpoint_socket_addr(endpoint: &TransportEndpoint) -> Result<SocketAddr> 
     })
 }
 
+fn endpoint_unix_path(endpoint: &TransportEndpoint) -> Result<&str> {
+    if endpoint.scheme != TransportScheme::Unix {
+        bail!("endpoint_unix_path is valid only for unix scheme");
+    }
+
+    endpoint
+        .path
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "/")
+        .ok_or_else(|| anyhow!("unix endpoint must include non-empty socket path"))
+}
+
 pub fn transport_for_scheme(scheme: TransportScheme) -> Result<Box<dyn Transport>> {
     match scheme {
         TransportScheme::Tcp => Ok(Box::new(TcpRawTransport)),
@@ -571,6 +627,7 @@ pub fn transport_for_scheme(scheme: TransportScheme) -> Result<Box<dyn Transport
         TransportScheme::Ws => Ok(Box::new(WsTransport)),
         TransportScheme::Wss => Ok(Box::new(WssTransport)),
         TransportScheme::Udp => Ok(Box::new(UdpRawTransport)),
+        TransportScheme::Unix => Ok(Box::new(UnixTransport)),
         _ => Err(anyhow!(
             "transport scheme '{scheme}' is not implemented in raw runtime yet"
         )),
@@ -1192,7 +1249,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 mod tests {
     use super::{
         Connection, G2Transport, H2Transport, QuicTransport, TcpRawTransport, TlsTransport,
-        Transport, TransportEndpoint, UdpRawTransport, WsTransport, WssTransport,
+        Transport, TransportEndpoint, UdpRawTransport, UnixTransport, WsTransport, WssTransport,
     };
     use anyhow::Result;
     use std::fs;
@@ -1227,6 +1284,61 @@ mod tests {
         assert_eq!(&out, b"world");
 
         server_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unix_transport_e2e_loopback() -> Result<()> {
+        let sock = std::env::temp_dir().join(format!(
+            "dsn-unix-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+
+        let listen_endpoint = TransportEndpoint::from_str(&format!("unix://{}", sock.display()))?;
+        let connect_endpoint = TransportEndpoint::from_str(&format!("unix://{}", sock.display()))?;
+
+        let server_task = tokio::spawn(async move {
+            let transport = UnixTransport;
+            let conn = transport
+                .listen(&listen_endpoint)
+                .await
+                .expect("listen unix");
+            let mut stream = match conn {
+                Connection::Stream(stream) => stream,
+                Connection::Datagram(_) => panic!("unix must return stream"),
+            };
+
+            let mut buf = [0u8; 5];
+            stream
+                .read_exact(&mut buf)
+                .await
+                .expect("read unix payload");
+            assert_eq!(&buf, b"hello");
+            stream
+                .write_all(b"world")
+                .await
+                .expect("write unix payload");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let transport = UnixTransport;
+        let conn = transport.connect(&connect_endpoint).await?;
+        let mut stream = match conn {
+            Connection::Stream(stream) => stream,
+            Connection::Datagram(_) => panic!("unix must return stream"),
+        };
+
+        stream.write_all(b"hello").await?;
+        let mut out = [0u8; 5];
+        stream.read_exact(&mut out).await?;
+        assert_eq!(&out, b"world");
+
+        server_task.await?;
+        let _ = std::fs::remove_file(&sock);
         Ok(())
     }
 

@@ -16,11 +16,15 @@ pub enum TransportScheme {
     Wss,
     H2,
     G2,
+    Unix,
 }
 
 impl TransportScheme {
     pub fn supports_path(self) -> bool {
-        matches!(self, Self::Ws | Self::Wss | Self::H2 | Self::G2)
+        matches!(
+            self,
+            Self::Ws | Self::Wss | Self::H2 | Self::G2 | Self::Unix
+        )
     }
 
     pub fn from_scheme(value: &str) -> Option<Self> {
@@ -33,6 +37,7 @@ impl TransportScheme {
             "wss" => Some(Self::Wss),
             "h2" => Some(Self::H2),
             "g2" => Some(Self::G2),
+            "unix" => Some(Self::Unix),
             _ => None,
         }
     }
@@ -49,6 +54,7 @@ impl Display for TransportScheme {
             Self::Wss => "wss",
             Self::H2 => "h2",
             Self::G2 => "g2",
+            Self::Unix => "unix",
         };
 
         write!(f, "{value}")
@@ -138,25 +144,43 @@ impl FromStr for TransportEndpoint {
         let scheme = TransportScheme::from_scheme(parsed.scheme())
             .ok_or_else(|| anyhow!("unsupported transport scheme '{}'", parsed.scheme()))?;
 
-        if parsed.host_str().is_none() {
-            bail!("transport endpoint must include host");
-        }
+        let host = if scheme == TransportScheme::Unix {
+            parsed.host_str().unwrap_or_default().to_owned()
+        } else {
+            if parsed.host_str().is_none() {
+                bail!("transport endpoint must include host");
+            }
+            parsed
+                .host_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow!("transport endpoint host is missing"))?
+        };
 
-        let host = parsed
-            .host_str()
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| anyhow!("transport endpoint host is missing"))?;
+        let (host, port) = if scheme == TransportScheme::Unix {
+            if parsed.port().is_some() {
+                bail!("unix endpoint must not contain port");
+            }
+            (parsed.host_str().unwrap_or_default().to_owned(), 0)
+        } else {
+            if !has_explicit_port(s) {
+                bail!("transport endpoint must include explicit port");
+            }
 
-        if !has_explicit_port(s) {
-            bail!("transport endpoint must include explicit port");
-        }
-
-        let port = parsed
-            .port_or_known_default()
-            .ok_or_else(|| anyhow!("transport endpoint must include explicit port"))?;
+            (
+                host,
+                parsed
+                    .port_or_known_default()
+                    .ok_or_else(|| anyhow!("transport endpoint must include explicit port"))?,
+            )
+        };
 
         let raw_path = parsed.path();
-        let path = if scheme.supports_path() {
+        let path = if scheme == TransportScheme::Unix {
+            if raw_path.is_empty() || raw_path == "/" {
+                bail!("unix endpoint must include socket path");
+            }
+            Some(raw_path.to_owned())
+        } else if scheme.supports_path() {
             Some(if raw_path.is_empty() || raw_path == "/" {
                 "/".to_owned()
             } else {
@@ -266,7 +290,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_scheme() {
-        let err = TransportEndpoint::from_str("unix://tmp.sock")
+        let err = TransportEndpoint::from_str("foo://tmp.sock")
             .expect_err("unsupported scheme must fail");
         assert!(err.to_string().contains("unsupported transport scheme"));
     }
@@ -311,6 +335,22 @@ mod tests {
         assert!(params.contains(TransportParam::Insecure.as_str()));
     }
 
+    #[test]
+    fn parses_unix_endpoint_with_socket_path() {
+        let endpoint = TransportEndpoint::from_str("unix:///tmp/dsn.sock")
+            .expect("unix endpoint should parse");
+
+        assert_eq!(endpoint.scheme, TransportScheme::Unix);
+        assert_eq!(endpoint.port, 0);
+        assert_eq!(endpoint.path.as_deref(), Some("/tmp/dsn.sock"));
+    }
+
+    #[test]
+    fn rejects_unix_endpoint_without_socket_path() {
+        let err = TransportEndpoint::from_str("unix:///")
+            .expect_err("unix endpoint without socket path must fail");
+        assert!(err.to_string().contains("socket path"));
+    }
     #[test]
     fn parses_boolean_values_for_query_flags() {
         assert!(parse_bool_param("1").expect("1 should parse as bool"));
