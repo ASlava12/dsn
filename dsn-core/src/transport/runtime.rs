@@ -620,18 +620,19 @@ fn endpoint_unix_path(endpoint: &TransportEndpoint) -> Result<&str> {
 }
 
 pub fn transport_for_scheme(scheme: TransportScheme) -> Result<Box<dyn Transport>> {
-    match scheme {
-        TransportScheme::Tcp => Ok(Box::new(TcpRawTransport)),
-        TransportScheme::Tls => Ok(Box::new(TlsTransport)),
-        TransportScheme::Quic => Ok(Box::new(QuicTransport)),
-        TransportScheme::Ws => Ok(Box::new(WsTransport)),
-        TransportScheme::Wss => Ok(Box::new(WssTransport)),
-        TransportScheme::Udp => Ok(Box::new(UdpRawTransport)),
-        TransportScheme::Unix => Ok(Box::new(UnixTransport)),
-        _ => Err(anyhow!(
-            "transport scheme '{scheme}' is not implemented in raw runtime yet"
-        )),
-    }
+    let transport: Box<dyn Transport> = match scheme {
+        TransportScheme::Tcp => Box::new(TcpRawTransport),
+        TransportScheme::Tls => Box::new(TlsTransport),
+        TransportScheme::Quic => Box::new(QuicTransport),
+        TransportScheme::Ws => Box::new(WsTransport),
+        TransportScheme::Wss => Box::new(WssTransport),
+        TransportScheme::H2 => Box::new(H2Transport),
+        TransportScheme::G2 => Box::new(G2Transport),
+        TransportScheme::Udp => Box::new(UdpRawTransport),
+        TransportScheme::Unix => Box::new(UnixTransport),
+    };
+
+    Ok(transport)
 }
 
 fn build_server_tls_acceptor(endpoint: &TransportEndpoint) -> Result<TlsAcceptor> {
@@ -1249,7 +1250,8 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 mod tests {
     use super::{
         Connection, G2Transport, H2Transport, QuicTransport, TcpRawTransport, TlsTransport,
-        Transport, TransportEndpoint, UdpRawTransport, UnixTransport, WsTransport, WssTransport,
+        Transport, TransportEndpoint, TransportScheme, UdpRawTransport, UnixTransport, WsTransport,
+        WssTransport, transport_for_scheme,
     };
     use anyhow::Result;
     use std::fs;
@@ -1699,6 +1701,12 @@ mod tests {
         server_task.await?;
         let _ = fs::remove_dir_all(&tmp);
         Ok(())
+    }
+
+    #[test]
+    fn transport_factory_supports_h2_and_g2() {
+        assert!(transport_for_scheme(TransportScheme::H2).is_ok());
+        assert!(transport_for_scheme(TransportScheme::G2).is_ok());
     }
 
     #[tokio::test]
