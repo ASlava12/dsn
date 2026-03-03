@@ -96,6 +96,7 @@ pub struct NodeContact {
     pub error_code: u16,
     pub node_id_contact: [u8; 32],
     pub nonce: [u8; 32],
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +219,8 @@ impl ControlMessage {
                 put_u64(&mut out, msg.request_id);
                 out.extend_from_slice(&msg.node_id_contact);
                 out.extend_from_slice(&msg.nonce);
+                put_u16(&mut out, msg.payload.len() as u16);
+                out.extend_from_slice(&msg.payload);
             }
             Self::SessionChangeRequest(msg) => {
                 out.push(ControlMsgType::SessionChangeRequest as u8);
@@ -325,12 +328,14 @@ impl ControlMessage {
             Some(ControlMsgType::NodeContact) => {
                 let node_id_contact = rd.read_fixed32()?;
                 let nonce = rd.read_fixed32()?;
+                let payload = rd.read_vec_u16()?;
                 Self::NodeContact(NodeContact {
                     request_id,
                     flags,
                     error_code,
                     node_id_contact,
                     nonce,
+                    payload,
                 })
             }
             Some(ControlMsgType::SessionChangeRequest) => {
@@ -498,6 +503,7 @@ mod tests {
                 error_code: 0,
                 node_id_contact: id(4),
                 nonce: id(5),
+                payload: b"payload".to_vec(),
             }),
         ];
 

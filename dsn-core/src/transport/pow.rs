@@ -50,6 +50,7 @@ pub struct PowChallenge {
     pub peer_id: [u8; 32],
     pub request_id: u64,
     pub target_id: [u8; 32],
+    pub challenge_seed: [u8; 32],
     pub nonce: u64,
     pub difficulty: u8,
 }
@@ -60,6 +61,7 @@ pub fn make_pow_tag(challenge: PowChallenge) -> [u8; 32] {
     hasher.update(&challenge.peer_id);
     hasher.update(&challenge.request_id.to_be_bytes());
     hasher.update(&challenge.target_id);
+    hasher.update(&challenge.challenge_seed);
     hasher.update(&challenge.nonce.to_be_bytes());
     *hasher.finalize().as_bytes()
 }
@@ -154,6 +156,7 @@ mod tests {
             peer_id: arr(1),
             request_id: 42,
             target_id: arr(2),
+            challenge_seed: arr(9),
             nonce: 0,
             difficulty: 20,
         };
@@ -169,6 +172,7 @@ mod tests {
             peer_id: arr(3),
             request_id: 100,
             target_id: arr(4),
+            challenge_seed: arr(8),
             nonce: 0,
             difficulty: 14,
         };

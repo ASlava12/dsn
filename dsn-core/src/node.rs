@@ -3,8 +3,9 @@ use crate::transport::AddressMode as HsAddressMode;
 use crate::{
     ControlMessage, ControlMsgType, ControlPing, ControlPong, ControlSessionChangeAck,
     ControlSessionChangeRequest, DhtRuntime, DsnConfig, MuxConfig, PeerLinks, PeerLinksMode,
-    REKEY_ACK_OK, REKEY_ACK_REJECTED, RekeyReason, SessionPolicy, SessionState, TransportEndpoint,
-    publish_public_identity, transport_for_scheme,
+    PowChallenge, PowScope, REKEY_ACK_OK, REKEY_ACK_REJECTED, RekeyReason, SessionPolicy,
+    SessionState, TokenBucket, TransportEndpoint, publish_public_identity, transport_for_scheme,
+    verify_pow,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine;
@@ -29,6 +30,12 @@ const DHT_NAMESPACE_MAIN: u32 = 0;
 const DHT_FLAG_RESPONSE: u16 = 0x1;
 const DHT_MSG_TYPE_MIN: u16 = ControlMsgType::FindNode as u16;
 const DHT_MSG_TYPE_MAX: u16 = ControlMsgType::NodeContact as u16;
+const NODE_CONTACT_FLAG_REQUEST: u16 = 0;
+const NODE_CONTACT_FLAG_CHALLENGE: u16 = 1;
+const NODE_CONTACT_FLAG_SOLUTION: u16 = 2;
+const NODE_CONTACT_FLAG_RESPONSE: u16 = 3;
+const NODE_CONTACT_CHALLENGE_TTL_US: u64 = 30_000_000;
+const NODE_CONTACT_DIFFICULTY: u8 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeStats {
@@ -103,6 +110,8 @@ struct DhtRequestManager {
     next_request_id: AtomicU64,
     rate_window_start_us: Mutex<u64>,
     rate_counter: Mutex<u32>,
+    pending_node_contact_challenge: Mutex<HashMap<u64, oneshot::Sender<crate::NodeContact>>>,
+    pending_node_contact_response: Mutex<HashMap<u64, oneshot::Sender<crate::NodeContact>>>,
 }
 
 impl DhtRequestManager {
@@ -112,6 +121,8 @@ impl DhtRequestManager {
             next_request_id: AtomicU64::new(1_000_000),
             rate_window_start_us: Mutex::new(0),
             rate_counter: Mutex::new(0),
+            pending_node_contact_challenge: Mutex::new(HashMap::new()),
+            pending_node_contact_response: Mutex::new(HashMap::new()),
         }
     }
 
@@ -140,6 +151,16 @@ struct PendingRekeyKeys {
     keys: SessionKeys,
 }
 
+struct NodeContactChallengeState {
+    peer_node_id: [u8; 32],
+    request_id: u64,
+    seed: [u8; 32],
+    difficulty: u8,
+    expires_at_us: u64,
+    issued_key_id: u32,
+    used: bool,
+}
+
 pub struct NodeRuntime {
     cfg: DsnConfig,
     dht: Arc<Mutex<DhtRuntime>>,
@@ -150,6 +171,8 @@ pub struct NodeRuntime {
     node_id: [u8; 32],
     peer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     dht_requests: Arc<DhtRequestManager>,
+    node_contact_challenges: Arc<Mutex<HashMap<[u8; 32], NodeContactChallengeState>>>,
+    node_contact_bucket: Arc<Mutex<TokenBucket>>,
 }
 
 pub struct NodeRuntimeHandle {
@@ -160,6 +183,7 @@ pub struct NodeRuntimeHandle {
     peer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     peers: Arc<RwLock<HashMap<String, Arc<PeerRuntime>>>>,
     dht_requests: Arc<DhtRequestManager>,
+    node_id: [u8; 32],
 }
 
 impl NodeRuntime {
@@ -189,6 +213,8 @@ impl NodeRuntime {
             node_id,
             peer_tasks: Arc::new(Mutex::new(Vec::new())),
             dht_requests: Arc::new(DhtRequestManager::new()),
+            node_contact_challenges: Arc::new(Mutex::new(HashMap::new())),
+            node_contact_bucket: Arc::new(Mutex::new(TokenBucket::new(32, 16, now))),
         }
     }
 
@@ -228,6 +254,7 @@ impl NodeRuntime {
             peer_tasks: shared.peer_tasks.clone(),
             peers: shared.peers.clone(),
             dht_requests: shared.dht_requests.clone(),
+            node_id: shared.node_id,
         }
     }
 }
@@ -304,6 +331,97 @@ impl NodeRuntimeHandle {
         }
 
         Err(anyhow!("dht FIND_NODE timeout after retries"))
+    }
+
+    pub async fn node_contact_request(&self, target_node_id: [u8; 32]) -> Result<Vec<u8>> {
+        let challenge = self.node_contact_get_challenge(target_node_id).await?;
+        let difficulty = challenge.error_code as u8;
+        let expires_at_us = parse_u64_payload(&challenge.payload)?;
+        let solution_nonce = solve_node_contact_pow(
+            self.node_id,
+            challenge.node_id_contact,
+            challenge.request_id,
+            challenge.nonce,
+            difficulty,
+            expires_at_us,
+        )
+        .ok_or_else(|| anyhow!("unable to solve NODE_CONTACT pow before deadline"))?;
+        self.node_contact_submit_solution(target_node_id, challenge, solution_nonce)
+            .await
+    }
+
+    pub async fn node_contact_get_challenge(
+        &self,
+        target_node_id: [u8; 32],
+    ) -> Result<crate::NodeContact> {
+        let peers = self.peers.read().await;
+        let Some(peer) = peers.values().next().cloned() else {
+            return Err(anyhow!("no active peers for NODE_CONTACT"));
+        };
+        drop(peers);
+
+        let request_id = self.dht_requests.next_request_id();
+        let (challenge_tx, challenge_rx) = oneshot::channel();
+        self.dht_requests
+            .pending_node_contact_challenge
+            .lock()
+            .await
+            .insert(request_id, challenge_tx);
+
+        let request = ControlMessage::NodeContact(crate::NodeContact {
+            request_id,
+            flags: NODE_CONTACT_FLAG_REQUEST,
+            error_code: 0,
+            node_id_contact: target_node_id,
+            nonce: [0u8; 32],
+            payload: Vec::new(),
+        });
+        send_control(peer.clone(), request).await?;
+
+        let challenge = tokio::time::timeout(Duration::from_millis(1200), challenge_rx)
+            .await
+            .map_err(|_| anyhow!("NODE_CONTACT challenge timeout"))??;
+        if challenge.flags != NODE_CONTACT_FLAG_CHALLENGE {
+            return Err(anyhow!("expected NODE_CONTACT challenge"));
+        }
+        Ok(challenge)
+    }
+
+    pub async fn node_contact_submit_solution(
+        &self,
+        target_node_id: [u8; 32],
+        challenge: crate::NodeContact,
+        solution_nonce: u64,
+    ) -> Result<Vec<u8>> {
+        let peers = self.peers.read().await;
+        let Some(peer) = peers.values().next().cloned() else {
+            return Err(anyhow!("no active peers for NODE_CONTACT"));
+        };
+        drop(peers);
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.dht_requests
+            .pending_node_contact_response
+            .lock()
+            .await
+            .insert(challenge.request_id, resp_tx);
+        let solve = ControlMessage::NodeContact(crate::NodeContact {
+            request_id: challenge.request_id,
+            flags: NODE_CONTACT_FLAG_SOLUTION,
+            error_code: 0,
+            node_id_contact: target_node_id,
+            nonce: challenge.nonce,
+            payload: solution_nonce.to_be_bytes().to_vec(),
+        });
+        send_control(peer, solve).await?;
+
+        let response = tokio::time::timeout(Duration::from_millis(1200), resp_rx)
+            .await
+            .map_err(|_| anyhow!("NODE_CONTACT response timeout"))??;
+        if response.flags != NODE_CONTACT_FLAG_RESPONSE {
+            return Err(anyhow!("NODE_CONTACT denied or invalid response"));
+        }
+        Ok(response.payload)
     }
 }
 
@@ -534,7 +652,7 @@ async fn handle_control_message(
             handle_dht_delete(runtime, peer, msg).await;
         }
         ControlMessage::NodeContact(msg) => {
-            handle_dht_node_contact(runtime, msg).await;
+            handle_dht_node_contact(runtime, peer, msg).await;
         }
     }
 }
@@ -631,7 +749,135 @@ async fn handle_dht_delete(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, ms
     }
 }
 
-async fn handle_dht_node_contact(runtime: Arc<NodeRuntime>, msg: crate::NodeContact) {
+async fn handle_dht_node_contact(
+    runtime: Arc<NodeRuntime>,
+    peer: Arc<PeerRuntime>,
+    msg: crate::NodeContact,
+) {
+    if msg.flags == NODE_CONTACT_FLAG_CHALLENGE {
+        if let Some(tx) = runtime
+            .dht_requests
+            .pending_node_contact_challenge
+            .lock()
+            .await
+            .remove(&msg.request_id)
+        {
+            let _ = tx.send(msg);
+        }
+        return;
+    }
+    if msg.flags == NODE_CONTACT_FLAG_RESPONSE {
+        if let Some(tx) = runtime
+            .dht_requests
+            .pending_node_contact_response
+            .lock()
+            .await
+            .remove(&msg.request_id)
+        {
+            let _ = tx.send(msg);
+        }
+        return;
+    }
+
+    if msg.flags == NODE_CONTACT_FLAG_REQUEST {
+        let now = now_us();
+        if runtime
+            .node_contact_bucket
+            .lock()
+            .await
+            .try_consume(now, 1)
+            .is_err()
+        {
+            return;
+        }
+        let mut seed_hasher = blake3::Hasher::new();
+        seed_hasher.update(b"dsn-node-contact-challenge-v1");
+        seed_hasher.update(&runtime.node_id);
+        seed_hasher.update(&msg.request_id.to_be_bytes());
+        seed_hasher.update(&now.to_be_bytes());
+        let seed = *seed_hasher.finalize().as_bytes();
+        let expires_at_us = now.saturating_add(NODE_CONTACT_CHALLENGE_TTL_US);
+        let issued_key_id = peer.session.lock().await.active_key_id();
+
+        runtime.node_contact_challenges.lock().await.insert(
+            seed,
+            NodeContactChallengeState {
+                peer_node_id: peer.peer_node_id,
+                request_id: msg.request_id,
+                seed,
+                difficulty: NODE_CONTACT_DIFFICULTY,
+                expires_at_us,
+                issued_key_id,
+                used: false,
+            },
+        );
+
+        let challenge = ControlMessage::NodeContact(crate::NodeContact {
+            request_id: msg.request_id,
+            flags: NODE_CONTACT_FLAG_CHALLENGE,
+            error_code: NODE_CONTACT_DIFFICULTY as u16,
+            node_id_contact: runtime.node_id,
+            nonce: seed,
+            payload: expires_at_us.to_be_bytes().to_vec(),
+        });
+        // best effort send back to requester: first connected peer
+        let _ = send_control(peer, challenge).await;
+        return;
+    }
+
+    if msg.flags == NODE_CONTACT_FLAG_SOLUTION {
+        let Some(solution_nonce) = parse_u64_payload(&msg.payload).ok() else {
+            return;
+        };
+        let now = now_us();
+        let mut challenges = runtime.node_contact_challenges.lock().await;
+        let Some(state) = challenges.get_mut(&msg.nonce) else {
+            return;
+        };
+        if state.used || state.request_id != msg.request_id || now > state.expires_at_us {
+            return;
+        }
+        if state.issued_key_id != peer.session.lock().await.active_key_id()
+            || state.peer_node_id != peer.peer_node_id
+        {
+            return;
+        }
+        let challenge = PowChallenge {
+            scope: PowScope::NodeContact,
+            peer_id: state.peer_node_id,
+            request_id: state.request_id,
+            target_id: runtime.node_id,
+            challenge_seed: state.seed,
+            nonce: solution_nonce,
+            difficulty: state.difficulty,
+        };
+        if verify_pow(challenge).is_err() {
+            return;
+        }
+        state.used = true;
+
+        let endpoint = runtime
+            .cfg
+            .listen
+            .first()
+            .map(endpoint_key)
+            .unwrap_or_default();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(endpoint.len() as u16).to_be_bytes());
+        payload.extend_from_slice(endpoint.as_bytes());
+        payload.extend_from_slice(&runtime.verifying.to_bytes());
+        let response = ControlMessage::NodeContact(crate::NodeContact {
+            request_id: msg.request_id,
+            flags: NODE_CONTACT_FLAG_RESPONSE,
+            error_code: 0,
+            node_id_contact: runtime.node_id,
+            nonce: msg.nonce,
+            payload,
+        });
+        let _ = send_control(peer, response).await;
+        return;
+    }
+
     runtime.dht.lock().await.add_known_node(msg.node_id_contact);
 }
 
@@ -1002,6 +1248,41 @@ fn derive_rekey_keys(
     }
 }
 
+fn parse_u64_payload(payload: &[u8]) -> Result<u64> {
+    if payload.len() < 8 {
+        return Err(anyhow!("payload too short for u64"));
+    }
+    Ok(u64::from_be_bytes(payload[0..8].try_into()?))
+}
+
+fn solve_node_contact_pow(
+    peer_id: [u8; 32],
+    target_id: [u8; 32],
+    request_id: u64,
+    challenge_seed: [u8; 32],
+    difficulty: u8,
+    expires_at_us: u64,
+) -> Option<u64> {
+    for nonce in 0..5_000_000u64 {
+        if now_us() > expires_at_us {
+            return None;
+        }
+        let challenge = PowChallenge {
+            scope: PowScope::NodeContact,
+            peer_id,
+            request_id,
+            target_id,
+            challenge_seed,
+            nonce,
+            difficulty,
+        };
+        if verify_pow(challenge).is_ok() {
+            return Some(nonce);
+        }
+    }
+    None
+}
+
 fn decode_signing_key(raw: &str) -> Result<SigningKey> {
     let bytes = if Path::new(raw).exists() {
         std::fs::read(raw)?
@@ -1168,7 +1449,7 @@ fn default_session_policy() -> SessionPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::NodeRuntime;
+    use super::{NodeRuntime, parse_u64_payload, solve_node_contact_pow};
     use crate::DsnConfig;
     use anyhow::Result;
     use tokio::time::{Duration, sleep};
@@ -1224,6 +1505,55 @@ mod tests {
         let got = node_a.dht_find_node(target, 1).await?;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0], target);
+
+        node_a.stop().await;
+        node_b.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_contact_requires_valid_pow_and_rejects_replay() -> Result<()> {
+        let mut cfg_a = DsnConfig::default_with_generated_identity()?;
+        let mut cfg_b = DsnConfig::default_with_generated_identity()?;
+
+        cfg_a.listen = vec!["tcp://127.0.0.1:19381".parse()?];
+        cfg_b.listen = vec!["tcp://127.0.0.1:19382".parse()?];
+        cfg_a.bootstrap_peers = vec!["tcp://127.0.0.1:19382".parse()?];
+        cfg_b.bootstrap_peers = vec!["tcp://127.0.0.1:19381".parse()?];
+
+        let node_a = NodeRuntime::new(cfg_a).start();
+        let node_b = NodeRuntime::new(cfg_b).start();
+        sleep(Duration::from_secs(8)).await;
+
+        let target = [7u8; 32];
+        let challenge = node_a.node_contact_get_challenge(target).await?;
+
+        let invalid = node_a
+            .node_contact_submit_solution(target, challenge.clone(), 0)
+            .await;
+        assert!(invalid.is_err(), "invalid pow must be rejected");
+
+        let difficulty = challenge.error_code as u8;
+        let expires_at = parse_u64_payload(&challenge.payload)?;
+        let nonce = solve_node_contact_pow(
+            node_a.node_id,
+            challenge.node_id_contact,
+            challenge.request_id,
+            challenge.nonce,
+            difficulty,
+            expires_at,
+        )
+        .expect("pow must solve");
+
+        let ok = node_a
+            .node_contact_submit_solution(target, challenge.clone(), nonce)
+            .await?;
+        assert!(!ok.is_empty());
+
+        let replay = node_a
+            .node_contact_submit_solution(target, challenge, nonce)
+            .await;
+        assert!(replay.is_err(), "replay of old solution must fail");
 
         node_a.stop().await;
         node_b.stop().await;
