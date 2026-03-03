@@ -7,6 +7,7 @@ pub mod pow;
 pub mod route;
 pub mod runtime;
 pub mod session;
+pub mod session_store;
 
 pub use control::{
     CONTROL_PROTOCOL_V1, ControlCodecError, ControlMessage, ControlMsgType, Delete, FindNode,
@@ -38,6 +39,10 @@ pub use route::{
 pub use session::{
     Ping, Pong, REKEY_AGE_THRESHOLD_US_V1, REKEY_BYTES_THRESHOLD_V1, SessionChangeAck,
     SessionChangeRequest, SessionPolicy, SessionState,
+};
+
+pub use session_store::{
+    PersistedPeerSession, SessionStore, SessionStoreKind, validate_redis_session_store_uri,
 };
 
 pub use endpoint::{
