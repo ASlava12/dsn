@@ -1,0 +1,95 @@
+services:
+  node1:
+    image: rust:1.85
+    working_dir: /workspace
+    volumes:
+      - ../../:/workspace
+      - ./state/node1:/state
+      - ./scripts:/scripts:ro
+    command: >
+      bash -lc "cargo build -p dsn-cli &&
+      CFG_PATH=/state/node1.toml
+      STATE_DIR=/state/node-state
+      LISTEN_JSON='[\"ws://0.0.0.0:8080/chat\",\"tcp://0.0.0.0:4101\"]'
+      BOOTSTRAP_JSON='[\"ws://node2:8080/chat\",\"ws://node3:8080/chat\"]'
+      /scripts/node-start.sh"
+
+  node2:
+    image: rust:1.85
+    working_dir: /workspace
+    volumes:
+      - ../../:/workspace
+      - ./state/node2:/state
+      - ./scripts:/scripts:ro
+    command: >
+      bash -lc "cargo build -p dsn-cli &&
+      CFG_PATH=/state/node2.toml
+      STATE_DIR=/state/node-state
+      LISTEN_JSON='[\"ws://0.0.0.0:8080/chat\",\"tcp://0.0.0.0:4101\"]'
+      BOOTSTRAP_JSON='[\"ws://node1:8080/chat\",\"ws://node3:8080/chat\"]'
+      /scripts/node-start.sh"
+
+  node3:
+    image: rust:1.85
+    working_dir: /workspace
+    volumes:
+      - ../../:/workspace
+      - ./state/node3:/state
+      - ./scripts:/scripts:ro
+    command: >
+      bash -lc "cargo build -p dsn-cli &&
+      CFG_PATH=/state/node3.toml
+      STATE_DIR=/state/node-state
+      LISTEN_JSON='[\"ws://0.0.0.0:8080/chat\",\"tcp://0.0.0.0:4101\"]'
+      BOOTSTRAP_JSON='[\"ws://node1:8080/chat\",\"ws://node2:8080/chat\"]'
+      /scripts/node-start.sh"
+
+
+  node:
+    image: rust:1.85
+    working_dir: /workspace
+    depends_on: [node1, node2, node3]
+    volumes:
+      - ../../:/workspace
+      - ./scripts:/scripts:ro
+    command: >
+      bash -lc "cargo build -p dsn-cli &&
+      CFG_PATH=/state/node.toml
+      STATE_DIR=/state/node-state
+      LISTEN_JSON='["ws://0.0.0.0:8080/chat","tcp://0.0.0.0:4101"]'
+      BOOTSTRAP_JSON='["ws://node1:8080/chat","ws://node2:8080/chat","ws://node3:8080/chat"]'
+      /scripts/node-start.sh"
+
+  nginx:
+    image: nginx:1.27
+    depends_on: [node1]
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+
+  haproxy:
+    image: haproxy:3.0
+    depends_on: [node1, node2, node3]
+    ports:
+      - "9443:9443"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  toxiproxy:
+    image: shopify/toxiproxy:2.11.0
+    ports:
+      - "8474:8474"
+      - "4101:4101"
+      - "4102:4102"
+      - "4103:4103"
+
+  toxiproxy-init:
+    image: shopify/toxiproxy:2.11.0
+    depends_on: [toxiproxy, node1, node2, node3]
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "toxiproxy-cli -h toxiproxy:8474 create node1_data -l 0.0.0.0:4101 -u node1:4101 || true;
+       toxiproxy-cli -h toxiproxy:8474 create node2_data -l 0.0.0.0:4102 -u node2:4101 || true;
+       toxiproxy-cli -h toxiproxy:8474 create node3_data -l 0.0.0.0:4103 -u node3:4101 || true"
