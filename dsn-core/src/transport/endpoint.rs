@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -61,7 +61,7 @@ impl Display for TransportScheme {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TransportEndpoint {
     pub scheme: TransportScheme,
     pub host: String,
@@ -69,6 +69,44 @@ pub struct TransportEndpoint {
     pub path: Option<String>,
     #[serde(default)]
     pub params: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransportEndpointObject {
+    scheme: TransportScheme,
+    host: String,
+    port: u16,
+    path: Option<String>,
+    #[serde(default)]
+    params: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TransportEndpointWire {
+    Url(String),
+    Object(TransportEndpointObject),
+}
+
+impl<'de> Deserialize<'de> for TransportEndpoint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TransportEndpointWire::deserialize(deserializer)?;
+        match wire {
+            TransportEndpointWire::Url(raw) => {
+                TransportEndpoint::from_str(&raw).map_err(serde::de::Error::custom)
+            }
+            TransportEndpointWire::Object(obj) => Ok(TransportEndpoint {
+                scheme: obj.scheme,
+                host: obj.host,
+                port: obj.port,
+                path: obj.path,
+                params: obj.params,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +389,16 @@ mod tests {
             .expect_err("unix endpoint without socket path must fail");
         assert!(err.to_string().contains("socket path"));
     }
+    #[test]
+    fn serde_accepts_string_endpoint() {
+        let raw = "- udp://127.0.0.1:9990\n";
+        let values: Vec<TransportEndpoint> = serde_yaml::from_str(raw).expect("deserialize");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].scheme, TransportScheme::Udp);
+        assert_eq!(values[0].host, "127.0.0.1");
+        assert_eq!(values[0].port, 9990);
+    }
+
     #[test]
     fn parses_boolean_values_for_query_flags() {
         assert!(parse_bool_param("1").expect("1 should parse as bool"));

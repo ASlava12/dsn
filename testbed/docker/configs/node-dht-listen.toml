@@ -1,0 +1,27 @@
+participate_in_dht = true
+address_mode = "all"
+
+[identity]
+algo = "ed25519"
+public_key = "<base64-public-key>"
+private_key = "<base64-private-key>"
+id = "<hex-node-id-64>"
+
+# Нода слушает websocket и tcp
+listen = [
+  "ws://0.0.0.0:8080/chat",
+  "tcp://0.0.0.0:4101",
+]
+
+# Минимум 2-3 bootstrap peers
+bootstrap_peers = [
+  "ws://node1:8080/chat",
+  "ws://node2:8080/chat",
+  "ws://node3:8080/chat",
+]
+
+# Address filter pipeline
+ip4_include_net = []
+ip4_exclude_net = []
+ip6_include_net = []
+ip6_exclude_net = []

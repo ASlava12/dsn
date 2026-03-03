@@ -2,9 +2,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use configparser::ini::Ini;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use crate::identity::generate_identity;
@@ -19,6 +21,40 @@ use value::set_in_value;
 
 const ENV_PREFIX: &str = "DSN";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressMode {
+    #[default]
+    PublicOnly,
+    GrayOnly,
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    #[serde(default = "default_state_dir")]
+    pub state_dir: String,
+    #[serde(default = "default_control_socket")]
+    pub control_socket: String,
+}
+
+fn default_state_dir() -> String {
+    "node-state".to_string()
+}
+
+fn default_control_socket() -> String {
+    "control.sock".to_string()
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: default_state_dir(),
+            control_socket: default_control_socket(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DsnConfig {
     #[serde(default)]
@@ -30,6 +66,24 @@ pub struct DsnConfig {
 
     #[serde(default)]
     pub listen: Vec<TransportEndpoint>,
+
+    #[serde(default)]
+    pub address_mode: AddressMode,
+
+    #[serde(default)]
+    pub ip4_include_net: Vec<String>,
+
+    #[serde(default)]
+    pub ip4_exclude_net: Vec<String>,
+
+    #[serde(default)]
+    pub ip6_include_net: Vec<String>,
+
+    #[serde(default)]
+    pub ip6_exclude_net: Vec<String>,
+
+    #[serde(default)]
+    pub node: NodeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +101,12 @@ impl DsnConfig {
             identity: generate_identity("ed25519")?,
             bootstrap_peers: Vec::new(),
             listen: Vec::new(),
+            address_mode: AddressMode::PublicOnly,
+            ip4_include_net: Vec::new(),
+            ip4_exclude_net: Vec::new(),
+            ip6_include_net: Vec::new(),
+            ip6_exclude_net: Vec::new(),
+            node: NodeConfig::default(),
         })
     }
 
@@ -89,7 +149,51 @@ impl DsnConfig {
             .context("failed to verify test signature")?;
 
         self.validate_transport_endpoints()?;
+        self.validate_address_filters()?;
+        self.validate_node_paths()?;
 
+        Ok(())
+    }
+
+    pub fn is_allowed_ipv4(&self, addr: Ipv4Addr) -> bool {
+        let include = parse_ipv4_nets(&self.ip4_include_net).ok();
+        let exclude = parse_ipv4_nets(&self.ip4_exclude_net).ok();
+
+        match (include, exclude) {
+            (Some(include), Some(exclude)) => {
+                is_allowed_ipv4(addr, self.address_mode, &include, &exclude)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_allowed_ipv6(&self, addr: Ipv6Addr) -> bool {
+        let include = parse_ipv6_nets(&self.ip6_include_net).ok();
+        let exclude = parse_ipv6_nets(&self.ip6_exclude_net).ok();
+
+        match (include, exclude) {
+            (Some(include), Some(exclude)) => {
+                is_allowed_ipv6(addr, self.address_mode, &include, &exclude)
+            }
+            _ => false,
+        }
+    }
+
+    fn validate_address_filters(&self) -> Result<()> {
+        parse_ipv4_nets(&self.ip4_include_net)?;
+        parse_ipv4_nets(&self.ip4_exclude_net)?;
+        parse_ipv6_nets(&self.ip6_include_net)?;
+        parse_ipv6_nets(&self.ip6_exclude_net)?;
+        Ok(())
+    }
+
+    fn validate_node_paths(&self) -> Result<()> {
+        if self.node.state_dir.trim().is_empty() {
+            bail!("node.state_dir must not be empty");
+        }
+        if self.node.control_socket.trim().is_empty() {
+            bail!("node.control_socket must not be empty");
+        }
         Ok(())
     }
 
@@ -139,6 +243,120 @@ fn validate_transport_endpoint(endpoint: &TransportEndpoint) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_ipv4_nets(values: &[String]) -> Result<Vec<Ipv4Net>> {
+    values
+        .iter()
+        .map(|raw| {
+            raw.parse::<Ipv4Net>()
+                .with_context(|| format!("invalid IPv4 CIDR '{raw}'"))
+        })
+        .collect()
+}
+
+fn parse_ipv6_nets(values: &[String]) -> Result<Vec<Ipv6Net>> {
+    values
+        .iter()
+        .map(|raw| {
+            raw.parse::<Ipv6Net>()
+                .with_context(|| format!("invalid IPv6 CIDR '{raw}'"))
+        })
+        .collect()
+}
+
+fn is_allowed_ipv4(
+    addr: Ipv4Addr,
+    mode: AddressMode,
+    include: &[Ipv4Net],
+    exclude: &[Ipv4Net],
+) -> bool {
+    if is_hard_deny_ipv4(addr) {
+        return false;
+    }
+
+    let in_gray = is_gray_ipv4(addr);
+    let mode_allowed = match mode {
+        AddressMode::PublicOnly => !in_gray,
+        AddressMode::GrayOnly => in_gray,
+        AddressMode::All => true,
+    };
+
+    if !mode_allowed {
+        return false;
+    }
+
+    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    if exclude.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    true
+}
+
+fn is_allowed_ipv6(
+    addr: Ipv6Addr,
+    mode: AddressMode,
+    include: &[Ipv6Net],
+    exclude: &[Ipv6Net],
+) -> bool {
+    if is_hard_deny_ipv6(addr) {
+        return false;
+    }
+
+    let in_gray = is_gray_ipv6(addr);
+    let mode_allowed = match mode {
+        AddressMode::PublicOnly => is_ipv6_gua(addr),
+        AddressMode::GrayOnly => in_gray,
+        AddressMode::All => true,
+    };
+
+    if !mode_allowed {
+        return false;
+    }
+
+    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    if exclude.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    true
+}
+
+fn is_hard_deny_ipv4(addr: Ipv4Addr) -> bool {
+    addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() || addr.is_link_local()
+}
+
+fn is_hard_deny_ipv6(addr: Ipv6Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+        || addr.is_unicast_link_local()
+}
+
+fn is_gray_ipv4(addr: Ipv4Addr) -> bool {
+    addr.is_private()
+        || Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 10)
+            .expect("valid cgnat")
+            .contains(&addr)
+}
+
+fn is_gray_ipv6(addr: Ipv6Addr) -> bool {
+    Ipv6Net::new("fd00::".parse().expect("valid ula"), 8)
+        .expect("valid ula net")
+        .contains(&addr)
+}
+
+fn is_ipv6_gua(addr: Ipv6Addr) -> bool {
+    Ipv6Net::new("2000::".parse().expect("valid gua"), 3)
+        .expect("valid gua net")
+        .contains(&addr)
 }
 
 pub fn init_config(path: &Path) -> Result<DsnConfig> {
@@ -403,7 +621,7 @@ fn apply_env_overrides(value: &mut Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DsnConfig, fix_config, init_config, load_config};
+    use super::{AddressMode, DsnConfig, fix_config, init_config, load_config};
     use crate::identity::generate_identity;
     use crate::transport::TransportEndpoint;
     use std::fs;
@@ -499,5 +717,80 @@ mod tests {
 
         let err = cfg.validate().expect_err("missing cert path must fail");
         assert!(err.to_string().contains("listen[0] is invalid"));
+    }
+
+    #[test]
+    fn address_filter_pipeline_ipv4_table() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.address_mode = AddressMode::PublicOnly;
+        cfg.ip4_include_net = vec!["1.0.0.0/8".to_owned()];
+        cfg.ip4_exclude_net = vec!["1.2.3.0/24".to_owned()];
+
+        let cases = [
+            ("1.1.1.1", true),
+            ("1.2.3.4", false),
+            ("10.0.0.1", false),
+            ("0.0.0.0", false),
+            ("127.0.0.1", false),
+        ];
+
+        for (raw, expected) in cases {
+            let ip = raw.parse().expect("ipv4 parse");
+            assert_eq!(cfg.is_allowed_ipv4(ip), expected, "ip={raw}");
+        }
+    }
+
+    #[test]
+    fn public_only_ipv6_accepts_only_gua() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.address_mode = AddressMode::PublicOnly;
+
+        let cases = [
+            ("2001:4860:4860::8888", true),
+            ("fd12::1", false),
+            ("fe80::1", false),
+            ("::1", false),
+            ("ff02::1", false),
+        ];
+
+        for (raw, expected) in cases {
+            let ip = raw.parse().expect("ipv6 parse");
+            assert_eq!(cfg.is_allowed_ipv6(ip), expected, "ip={raw}");
+        }
+    }
+
+    #[test]
+    fn yaml_listen_as_string_endpoints_deserializes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dsn-yaml-endpoint-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let path = base.join("config.yaml");
+
+        let id = generate_identity("ed25519").expect("identity");
+        let raw = format!(
+            "address_mode: public_only\nparticipate_in_dht: false\nidentity:\n  algo: {}\n  id: {}\n  private_key: {}\n  public_key: {}\nlisten:\n  - udp://127.0.0.2:9990\nbootstrap_peers: []\nip4_include_net: []\nip4_exclude_net: []\nip6_include_net: []\nip6_exclude_net: []\n",
+            id.algo, id.id, id.private_key, id.public_key
+        );
+        fs::write(&path, raw).expect("write config");
+
+        let cfg = load_config(&path).expect("yaml with string endpoints should load");
+        assert_eq!(cfg.listen.len(), 1);
+        assert_eq!(cfg.listen[0].scheme, crate::transport::TransportScheme::Udp);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_cidr_filters() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.ip4_include_net = vec!["not-a-cidr".to_owned()];
+
+        let err = cfg.validate().expect_err("invalid CIDR must fail");
+        assert!(err.to_string().contains("invalid IPv4 CIDR"));
     }
 }
