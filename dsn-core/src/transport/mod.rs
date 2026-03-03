@@ -4,6 +4,7 @@ pub mod frame;
 pub mod handshake;
 pub mod mux;
 pub mod pow;
+pub mod route;
 pub mod runtime;
 pub mod session;
 
@@ -28,6 +29,10 @@ pub use mux::{MultiConn, MuxConfig, MuxConn, MuxError, PeerLinks, PeerLinksMode}
 
 pub use pow::{
     PowChallenge, PowError, PowScope, TokenBucket, leading_zero_bits, make_pow_tag, verify_pow,
+};
+
+pub use route::{
+    CreateRouteRequest, ROUTE_TTL_US, RouteAcl, RouteEntry, RouteManager, RouteStorageKind,
 };
 
 pub use session::{

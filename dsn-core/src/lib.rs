@@ -16,21 +16,20 @@ pub use identity::{
 
 pub use dht::{DhtRecord, DhtRuntime, PUBLICATION_TTL_US};
 
-pub use dht::{DhtRecord, DhtRuntime};
-
 pub use transport::{
     AddressMode, AsyncReadWrite, BoxedStreamConn, CONTROL_PROTOCOL_V1, ClientHandshakeState,
     ClientHello, Connection, ControlCodecError, ControlMessage, ControlMsgType, ControlPing,
-    ControlPong, DatagramConn, Delete, EncryptedFrame, FRAME_V1_MAGIC, FRAME_V1_VERSION, FindNode,
-    FindValue, Finished, FrameClass, FrameIoError, FrameLimits, FrameV1, G2Transport, H2Transport,
-    HANDSHAKE_V1_VERSION, HandshakeConfig, HandshakeError, MultiConn, MuxConfig, MuxConn, MuxError,
-    NodeContact, PeerLinks, PeerLinksMode, Ping, Pong, PowChallenge, PowError, PowScope,
-    QuicTransport, REKEY_AGE_THRESHOLD_US_V1, REKEY_BYTES_THRESHOLD_V1, ServerHandshakeState,
-    ServerHello, SessionChangeAck, SessionChangeRequest, SessionKeys, SessionPolicy, SessionState,
-    Store, TcpRawTransport, TlsTransport, TokenBucket, Transport, TransportEndpoint,
-    TransportParam, TransportScheme, UdpRawTransport, UnixTransport, WsTransport, WssTransport,
-    build_client_hello, decrypt_frame, encrypt_frame, endpoint_socket_addr, handle_client_hello,
-    handle_server_hello, leading_zero_bits, make_pow_tag, parse_bool_param, read_frame,
-    reserved_transport_params, server_session_keys, transport_for_scheme, verify_finished,
-    verify_pow, write_frame,
+    ControlPong, CreateRouteRequest, DatagramConn, Delete, EncryptedFrame, FRAME_V1_MAGIC,
+    FRAME_V1_VERSION, FindNode, FindValue, Finished, FrameClass, FrameIoError, FrameLimits,
+    FrameV1, G2Transport, H2Transport, HANDSHAKE_V1_VERSION, HandshakeConfig, HandshakeError,
+    MultiConn, MuxConfig, MuxConn, MuxError, NodeContact, PeerLinks, PeerLinksMode, Ping, Pong,
+    PowChallenge, PowError, PowScope, QuicTransport, REKEY_AGE_THRESHOLD_US_V1,
+    REKEY_BYTES_THRESHOLD_V1, ROUTE_TTL_US, RouteAcl, RouteEntry, RouteManager, RouteStorageKind,
+    ServerHandshakeState, ServerHello, SessionChangeAck, SessionChangeRequest, SessionKeys,
+    SessionPolicy, SessionState, Store, TcpRawTransport, TlsTransport, TokenBucket, Transport,
+    TransportEndpoint, TransportParam, TransportScheme, UdpRawTransport, UnixTransport,
+    WsTransport, WssTransport, build_client_hello, decrypt_frame, encrypt_frame,
+    endpoint_socket_addr, handle_client_hello, handle_server_hello, leading_zero_bits,
+    make_pow_tag, parse_bool_param, read_frame, reserved_transport_params, server_session_keys,
+    transport_for_scheme, verify_finished, verify_pow, write_frame,
 };
