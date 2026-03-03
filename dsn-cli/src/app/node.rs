@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use dsn_core::{DsnConfig, NodeRuntime, RuntimeStats, load_config, resolve_config_path};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::fs;
@@ -15,7 +14,6 @@ use crate::cmd::cli::NodeCommands;
 struct DhtCliState {
     ip4_enabled: bool,
     ip6_enabled: bool,
-    names: HashMap<String, String>,
 }
 
 pub async fn handle(command: NodeCommands, explicit_config: Option<PathBuf>) -> Result<()> {
@@ -258,15 +256,48 @@ async fn read_status(path: &Path) -> Result<PersistedStatus> {
 
 #[cfg(test)]
 mod tests {
-    use super::state_dir_for;
+    use super::{DhtCliState, handle_dht_admin_request, state_dir_for};
     use anyhow::Result;
+    use dsn_core::DhtRuntime;
     use std::path::Path;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn state_dir_is_adjacent_to_config() -> Result<()> {
         let dir = state_dir_for(Some(Path::new("/tmp/dsn/config.toml")), None)?;
         assert_eq!(dir, Path::new("/tmp/dsn/node-state"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn name_commands_are_backed_by_dht_runtime() {
+        let dht = Arc::new(Mutex::new(DhtRuntime::new([1; 32], true)));
+        let cli_state = Arc::new(Mutex::new(DhtCliState::default()));
+
+        let take =
+            handle_dht_admin_request("name take test", dht.clone(), "node-a", cli_state.clone())
+                .await;
+        assert_eq!(take.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let get =
+            handle_dht_admin_request("name get test", dht.clone(), "node-a", cli_state.clone())
+                .await;
+        assert_eq!(get.get("owner").and_then(|v| v.as_str()), Some("node-a"));
+
+        let check =
+            handle_dht_admin_request("name check test", dht.clone(), "node-a", cli_state.clone())
+                .await;
+        assert_eq!(
+            check.get("available").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let dht_guard = dht.lock().await;
+        assert_eq!(
+            dht_guard.find_value("name", b"test").as_deref(),
+            Some(b"node-a".as_slice())
+        );
     }
 }
 
@@ -359,22 +390,26 @@ async fn handle_dht_admin_request(
             }
         }
         ["name", "check", name] => {
-            let st = cli_state.lock().await;
-            serde_json::json!({"available": !st.names.contains_key(*name)})
+            let guard = dht.lock().await;
+            let available = guard.find_value("name", name.as_bytes()).is_none();
+            serde_json::json!({"available": available})
         }
         ["name", "get", name] => {
-            let st = cli_state.lock().await;
-            match st.names.get(*name) {
+            let guard = dht.lock().await;
+            match guard
+                .find_value("name", name.as_bytes())
+                .and_then(|v| String::from_utf8(v).ok())
+            {
                 Some(owner) => serde_json::json!({"name":name,"owner":owner}),
                 None => serde_json::json!({"error":"not found"}),
             }
         }
         ["name", "take", name] => {
-            let mut st = cli_state.lock().await;
-            if st.names.contains_key(*name) {
+            let mut guard = dht.lock().await;
+            if guard.find_value("name", name.as_bytes()).is_some() {
                 serde_json::json!({"error":"name is already taken"})
             } else {
-                st.names.insert((*name).to_string(), my_id.to_string());
+                guard.store("name", name.as_bytes().to_vec(), my_id.as_bytes().to_vec());
                 serde_json::json!({"ok":true,"name":name,"owner":my_id})
             }
         }
