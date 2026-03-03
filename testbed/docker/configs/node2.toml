@@ -1,0 +1,11 @@
+participate_in_dht = true
+address_mode = "all"
+
+[identity]
+algo = "ed25519"
+public_key = ""
+private_key = ""
+id = ""
+
+bootstrap_peers = ["ws://node1:8080/chat", "ws://node3:8080/chat"]
+listen = ["ws://0.0.0.0:8080/chat", "tcp://0.0.0.0:4101"]

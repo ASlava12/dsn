@@ -98,3 +98,17 @@ leading_zero_bits(blake3(challenge_context || nonce)) >= difficulty
 - address publish
 
 Целевой SLA: стабильное выполнение < 30s на типичном CI runner.
+
+
+## 6. Docker testbed (LB + деградации)
+
+Для сценариев с балансировкой и деградациями используется отдельный docker-стенд. Подробности: `docs/testbed-docker.md`.
+
+Покрытие:
+
+- wss за nginx
+- latency 200ms
+- loss 5%
+- падение data в MultiConn
+
+Критерий приёмки: наблюдаемое поведение соответствует transport/session/mux документации v0.1.
