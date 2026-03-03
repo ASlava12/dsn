@@ -12,8 +12,16 @@ pub use config::{
 pub use identity::generate_identity;
 
 pub use transport::{
-    AsyncReadWrite, BoxedStreamConn, Connection, DatagramConn, G2Transport, H2Transport,
-    QuicTransport, TcpRawTransport, TlsTransport, Transport, TransportEndpoint, TransportParam,
-    TransportScheme, UdpRawTransport, UnixTransport, WsTransport, WssTransport,
-    endpoint_socket_addr, parse_bool_param, reserved_transport_params, transport_for_scheme,
+    AddressMode, AsyncReadWrite, BoxedStreamConn, ClientHandshakeState, ClientHello, Connection,
+    DatagramConn, EncryptedFrame, FRAME_V1_MAGIC, FRAME_V1_VERSION, Finished, FrameClass,
+    FrameIoError, FrameLimits, FrameV1, G2Transport, H2Transport, HANDSHAKE_V1_VERSION,
+    HandshakeConfig, HandshakeError, MultiConn, MuxConfig, MuxConn, MuxError, PeerLinks,
+    PeerLinksMode, Ping, Pong, PowChallenge, PowError, PowScope, QuicTransport,
+    REKEY_AGE_THRESHOLD_US_V1, REKEY_BYTES_THRESHOLD_V1, ServerHandshakeState, ServerHello,
+    SessionChangeAck, SessionChangeRequest, SessionKeys, SessionPolicy, SessionState,
+    TcpRawTransport, TlsTransport, TokenBucket, Transport, TransportEndpoint, TransportParam,
+    TransportScheme, UdpRawTransport, UnixTransport, WsTransport, WssTransport, build_client_hello,
+    decrypt_frame, encrypt_frame, endpoint_socket_addr, handle_client_hello, handle_server_hello,
+    leading_zero_bits, make_pow_tag, parse_bool_param, read_frame, reserved_transport_params,
+    server_session_keys, transport_for_scheme, verify_finished, verify_pow, write_frame,
 };
