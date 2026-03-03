@@ -31,6 +31,7 @@ pub struct NodeRuntimeHandle {
     shutdown_tx: watch::Sender<bool>,
     join_handles: Vec<JoinHandle<()>>,
     stats: Arc<Mutex<RuntimeStats>>,
+    dht: Arc<Mutex<DhtRuntime>>,
 }
 
 impl NodeRuntime {
@@ -59,6 +60,7 @@ impl NodeRuntime {
     pub fn start(self) -> NodeRuntimeHandle {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut join_handles = Vec::new();
+        let dht = self.dht.clone();
 
         join_handles.push(tokio::spawn(run_bootstrap_loop(
             self.cfg.bootstrap_peers.clone(),
@@ -81,7 +83,7 @@ impl NodeRuntime {
 
         join_handles.push(tokio::spawn(run_dht_publication_loop(
             self.cfg.clone(),
-            self.dht,
+            dht.clone(),
             self.stats.clone(),
             shutdown_rx,
         )));
@@ -90,6 +92,7 @@ impl NodeRuntime {
             shutdown_tx,
             join_handles,
             stats: self.stats,
+            dht,
         }
     }
 }
@@ -104,6 +107,10 @@ impl NodeRuntimeHandle {
 
     pub async fn snapshot(&self) -> RuntimeStats {
         self.stats.lock().await.clone()
+    }
+
+    pub fn dht(&self) -> Arc<Mutex<DhtRuntime>> {
+        self.dht.clone()
     }
 }
 

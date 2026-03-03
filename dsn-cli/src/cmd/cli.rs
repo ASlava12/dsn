@@ -16,6 +16,7 @@ pub enum Commands {
     Config(ConfigArgs),
     Transport(TransportArgs),
     Node(NodeArgs),
+    Dht(DhtArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -45,6 +46,64 @@ pub enum NodeCommands {
     Run {
         #[arg(long)]
         state_dir: PathBuf,
+    },
+}
+
+#[derive(Parser, Debug)]
+pub struct DhtArgs {
+    #[command(subcommand)]
+    pub command: DhtCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DhtCommands {
+    Namespaces,
+    Main {
+        #[command(subcommand)]
+        command: DhtMainCommands,
+    },
+    Ip4 {
+        #[command(subcommand)]
+        command: DhtIpCommands,
+    },
+    Ip6 {
+        #[command(subcommand)]
+        command: DhtIpCommands,
+    },
+    Name {
+        #[command(subcommand)]
+        command: DhtNameCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DhtMainCommands {
+    My,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DhtIpCommands {
+    On,
+    Off,
+    Status,
+    Get { value: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DhtNameCommands {
+    Check {
+        name: String,
+    },
+    Get {
+        name: String,
+    },
+    Take {
+        name: String,
+    },
+    Challenge {
+        name: String,
+        #[arg(long = "difficulty")]
+        difficulty: Option<u8>,
     },
 }
 

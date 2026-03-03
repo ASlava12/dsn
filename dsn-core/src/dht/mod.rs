@@ -104,6 +104,12 @@ impl DhtRuntime {
         }
     }
 
+    pub fn namespaces(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.stores.keys().cloned().collect();
+        out.sort();
+        out
+    }
+
     pub fn find_node(&self, target_id: [u8; 32], max: usize) -> Vec<[u8; 32]> {
         let mut nodes = self.known_nodes.clone();
         nodes.sort_by_key(|id| xor_distance_prefix(*id, target_id));
@@ -189,6 +195,17 @@ mod tests {
         assert!(dht.has_cached_request(&fingerprint, 1_000));
         assert!(dht.has_cached_request(&fingerprint, 1_000 + 4 * 60 * 1_000_000));
         assert!(!dht.has_cached_request(&fingerprint, 1_000 + 5 * 60 * 1_000_000 + 1));
+    }
+
+    #[test]
+    fn namespaces_lists_known_namespaces() {
+        let mut dht = DhtRuntime::new(id(1), true);
+        dht.store("ip4", b"a".to_vec(), b"1".to_vec());
+        dht.store("main", b"b".to_vec(), b"2".to_vec());
+        assert_eq!(
+            dht.namespaces(),
+            vec!["ip4".to_string(), "main".to_string()]
+        );
     }
 
     #[test]

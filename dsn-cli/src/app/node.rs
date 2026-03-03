@@ -1,11 +1,22 @@
 use anyhow::{Context, Result, bail};
 use dsn_core::{DsnConfig, NodeRuntime, RuntimeStats, load_config, resolve_config_path};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
+use tokio::sync::Mutex;
 
 use crate::cmd::cli::NodeCommands;
+
+#[derive(Debug, Default)]
+struct DhtCliState {
+    ip4_enabled: bool,
+    ip6_enabled: bool,
+    names: HashMap<String, String>,
+}
 
 pub async fn handle(command: NodeCommands, explicit_config: Option<PathBuf>) -> Result<()> {
     match command {
@@ -101,10 +112,23 @@ async fn run_foreground(explicit_config: Option<PathBuf>, state_dir: PathBuf) ->
     fs::create_dir_all(&state_dir).await?;
     let pid_path = state_dir.join("node.pid");
     let stats_path = state_dir.join("status.json");
+    let control_sock_path = state_dir.join("control.sock");
 
     let cfg = load_runtime_config(explicit_config.as_deref())?;
-    let runtime = NodeRuntime::new(cfg);
+    let runtime = NodeRuntime::new(cfg.clone());
     let handle = runtime.start();
+    let dht = handle.dht();
+    let cli_state = std::sync::Arc::new(Mutex::new(DhtCliState::default()));
+
+    if std::fs::metadata(&control_sock_path).is_ok() {
+        let _ = std::fs::remove_file(&control_sock_path);
+    }
+    let control_task = tokio::spawn(run_control_socket_server(
+        control_sock_path.clone(),
+        dht,
+        cfg.identity.id.clone(),
+        cli_state,
+    ));
 
     fs::write(&pid_path, std::process::id().to_string()).await?;
 
@@ -125,8 +149,10 @@ async fn run_foreground(explicit_config: Option<PathBuf>, state_dir: PathBuf) ->
         }
     }
 
+    control_task.abort();
     handle.stop().await;
     let _ = fs::remove_file(&pid_path).await;
+    let _ = fs::remove_file(&control_sock_path).await;
     Ok(())
 }
 
@@ -210,5 +236,140 @@ mod tests {
         let dir = state_dir_for(Some(Path::new("/tmp/dsn/config.toml")))?;
         assert_eq!(dir, Path::new("/tmp/dsn/node-state"));
         Ok(())
+    }
+}
+
+async fn run_control_socket_server(
+    sock_path: PathBuf,
+    dht: std::sync::Arc<Mutex<dsn_core::DhtRuntime>>,
+    my_id: String,
+    cli_state: std::sync::Arc<Mutex<DhtCliState>>,
+) -> Result<()> {
+    let listener = UnixListener::bind(&sock_path)
+        .with_context(|| format!("failed to bind control socket {}", sock_path.display()))?;
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let dht = dht.clone();
+        let my_id = my_id.clone();
+        let cli_state = cli_state.clone();
+        tokio::spawn(async move {
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            let response = match reader.read_line(&mut line).await {
+                Ok(0) => serde_json::json!({"error":"empty request"}),
+                Ok(_) => handle_dht_admin_request(line.trim(), dht, &my_id, cli_state).await,
+                Err(e) => serde_json::json!({"error": format!("io error: {e}")}),
+            };
+            let _ = write_half
+                .write_all(format!("{}\n", response).as_bytes())
+                .await;
+        });
+    }
+}
+
+async fn handle_dht_admin_request(
+    request: &str,
+    dht: std::sync::Arc<Mutex<dsn_core::DhtRuntime>>,
+    my_id: &str,
+    cli_state: std::sync::Arc<Mutex<DhtCliState>>,
+) -> serde_json::Value {
+    let parts: Vec<&str> = request.split_whitespace().collect();
+    if parts.is_empty() {
+        return serde_json::json!({"error":"empty request"});
+    }
+
+    match parts.as_slice() {
+        ["namespaces"] => {
+            let guard = dht.lock().await;
+            serde_json::json!({"namespaces": guard.namespaces()})
+        }
+        ["main", "my"] => {
+            let guard = dht.lock().await;
+            let value = guard.find_value("main", my_id.as_bytes());
+            match value.and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok()) {
+                Some(pid) => serde_json::json!({"identity": pid}),
+                None => serde_json::json!({"error":"identity not published yet"}),
+            }
+        }
+        ["ip4", "on"] => {
+            cli_state.lock().await.ip4_enabled = true;
+            serde_json::json!({"ok":true,"ip4_enabled":true})
+        }
+        ["ip4", "off"] => {
+            cli_state.lock().await.ip4_enabled = false;
+            serde_json::json!({"ok":true,"ip4_enabled":false})
+        }
+        ["ip4", "status"] => serde_json::json!({"ip4_enabled":cli_state.lock().await.ip4_enabled}),
+        ["ip4", "get", addr] => {
+            let guard = dht.lock().await;
+            let value = guard.find_value("ip4", addr.as_bytes());
+            match value.and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok()) {
+                Some(pid) => serde_json::json!({"identity": pid}),
+                None => serde_json::json!({"error":"not found"}),
+            }
+        }
+        ["ip6", "on"] => {
+            cli_state.lock().await.ip6_enabled = true;
+            serde_json::json!({"ok":true,"ip6_enabled":true})
+        }
+        ["ip6", "off"] => {
+            cli_state.lock().await.ip6_enabled = false;
+            serde_json::json!({"ok":true,"ip6_enabled":false})
+        }
+        ["ip6", "status"] => serde_json::json!({"ip6_enabled":cli_state.lock().await.ip6_enabled}),
+        ["ip6", "get", addr] => {
+            let guard = dht.lock().await;
+            let value = guard.find_value("ip6", addr.as_bytes());
+            match value.and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok()) {
+                Some(pid) => serde_json::json!({"identity": pid}),
+                None => serde_json::json!({"error":"not found"}),
+            }
+        }
+        ["name", "check", name] => {
+            let st = cli_state.lock().await;
+            serde_json::json!({"available": !st.names.contains_key(*name)})
+        }
+        ["name", "get", name] => {
+            let st = cli_state.lock().await;
+            match st.names.get(*name) {
+                Some(owner) => serde_json::json!({"name":name,"owner":owner}),
+                None => serde_json::json!({"error":"not found"}),
+            }
+        }
+        ["name", "take", name] => {
+            let mut st = cli_state.lock().await;
+            if st.names.contains_key(*name) {
+                serde_json::json!({"error":"name is already taken"})
+            } else {
+                st.names.insert((*name).to_string(), my_id.to_string());
+                serde_json::json!({"ok":true,"name":name,"owner":my_id})
+            }
+        }
+        ["name", "challenge", name, difficulty] => {
+            let diff = difficulty.parse::<u8>().unwrap_or(8);
+            let mut nonce: u64 = 0;
+            loop {
+                let tag = blake3::hash(format!("dsn:name:{}:{}:{}", name, my_id, nonce).as_bytes());
+                let mut lead: u8 = 0;
+                for b in tag.as_bytes() {
+                    if *b == 0 {
+                        lead = lead.saturating_add(8);
+                    } else {
+                        lead = lead.saturating_add(b.leading_zeros() as u8);
+                        break;
+                    }
+                }
+                if lead >= diff {
+                    break serde_json::json!({"name":name,"difficulty":diff,"nonce":nonce});
+                }
+                nonce = nonce.saturating_add(1);
+                if nonce > 5_000_000 {
+                    break serde_json::json!({"error":"challenge limit exceeded"});
+                }
+            }
+        }
+        _ => serde_json::json!({"error":"unknown command"}),
     }
 }
