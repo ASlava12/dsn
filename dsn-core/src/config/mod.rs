@@ -275,6 +275,14 @@ fn is_allowed_ipv4(
         return false;
     }
 
+    if exclude.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
     let in_gray = is_gray_ipv4(addr);
     let mode_allowed = match mode {
         AddressMode::PublicOnly => !in_gray,
@@ -283,14 +291,6 @@ fn is_allowed_ipv4(
     };
 
     if !mode_allowed {
-        return false;
-    }
-
-    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
-        return false;
-    }
-
-    if exclude.iter().any(|n| n.contains(&addr)) {
         return false;
     }
 
@@ -307,6 +307,14 @@ fn is_allowed_ipv6(
         return false;
     }
 
+    if exclude.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
     let in_gray = is_gray_ipv6(addr);
     let mode_allowed = match mode {
         AddressMode::PublicOnly => is_ipv6_gua(addr),
@@ -315,14 +323,6 @@ fn is_allowed_ipv6(
     };
 
     if !mode_allowed {
-        return false;
-    }
-
-    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
-        return false;
-    }
-
-    if exclude.iter().any(|n| n.contains(&addr)) {
         return false;
     }
 
