@@ -16,6 +16,8 @@ pub use identity::{
 
 pub use dht::{DhtRecord, DhtRuntime, PUBLICATION_TTL_US};
 
+pub use dht::{DhtRecord, DhtRuntime};
+
 pub use transport::{
     AddressMode, AsyncReadWrite, BoxedStreamConn, CONTROL_PROTOCOL_V1, ClientHandshakeState,
     ClientHello, Connection, ControlCodecError, ControlMessage, ControlMsgType, ControlPing,
