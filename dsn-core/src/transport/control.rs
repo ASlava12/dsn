@@ -13,6 +13,8 @@ pub enum ControlMsgType {
     Store = 4,
     Delete = 5,
     NodeContact = 6,
+    SessionChangeRequest = 7,
+    SessionChangeAck = 8,
 }
 
 impl ControlMsgType {
@@ -25,10 +27,15 @@ impl ControlMsgType {
             4 => Some(Self::Store),
             5 => Some(Self::Delete),
             6 => Some(Self::NodeContact),
+            7 => Some(Self::SessionChangeRequest),
+            8 => Some(Self::SessionChangeAck),
             _ => None,
         }
     }
 }
+
+pub const REKEY_ACK_OK: u16 = 0;
+pub const REKEY_ACK_REJECTED: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ping {
@@ -88,6 +95,22 @@ pub struct NodeContact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionChangeRequest {
+    pub request_id: u64,
+    pub new_key_id: u32,
+    pub requester_node_id: [u8; 32],
+    pub kem_payload: Vec<u8>,
+    pub sign: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionChangeAck {
+    pub request_id: u64,
+    pub key_id: u32,
+    pub status: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMessage {
     Ping(Ping),
     Pong(Pong),
@@ -96,6 +119,8 @@ pub enum ControlMessage {
     Store(Store),
     Delete(Delete),
     NodeContact(NodeContact),
+    SessionChangeRequest(SessionChangeRequest),
+    SessionChangeAck(SessionChangeAck),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +215,25 @@ impl ControlMessage {
                 out.extend_from_slice(&msg.node_id_contact);
                 out.extend_from_slice(&msg.nonce);
             }
+            Self::SessionChangeRequest(msg) => {
+                out.push(ControlMsgType::SessionChangeRequest as u8);
+                put_u16(&mut out, 0);
+                put_u16(&mut out, 0);
+                put_u64(&mut out, msg.request_id);
+                put_u32(&mut out, msg.new_key_id);
+                out.extend_from_slice(&msg.requester_node_id);
+                put_u16(&mut out, msg.kem_payload.len() as u16);
+                out.extend_from_slice(&msg.kem_payload);
+                put_u16(&mut out, msg.sign.len() as u16);
+                out.extend_from_slice(&msg.sign);
+            }
+            Self::SessionChangeAck(msg) => {
+                out.push(ControlMsgType::SessionChangeAck as u8);
+                put_u16(&mut out, msg.status);
+                put_u16(&mut out, 0);
+                put_u64(&mut out, msg.request_id);
+                put_u32(&mut out, msg.key_id);
+            }
         }
 
         out
@@ -279,6 +323,27 @@ impl ControlMessage {
                     error_code,
                     node_id_contact,
                     nonce,
+                })
+            }
+            Some(ControlMsgType::SessionChangeRequest) => {
+                let new_key_id = rd.read_u32()?;
+                let requester_node_id = rd.read_fixed32()?;
+                let kem_payload = rd.read_vec_u16()?;
+                let sign = rd.read_vec_u16()?;
+                Self::SessionChangeRequest(SessionChangeRequest {
+                    request_id,
+                    new_key_id,
+                    requester_node_id,
+                    kem_payload,
+                    sign,
+                })
+            }
+            Some(ControlMsgType::SessionChangeAck) => {
+                let key_id = rd.read_u32()?;
+                Self::SessionChangeAck(SessionChangeAck {
+                    request_id,
+                    key_id,
+                    status: flags,
                 })
             }
             None => return Err(ControlCodecError::UnknownMessageType(msg_type)),

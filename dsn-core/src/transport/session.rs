@@ -72,6 +72,12 @@ pub struct SessionState {
     rtt_ring_us: VecDeque<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekeyReason {
+    Bytes,
+    Age,
+}
+
 impl SessionState {
     pub fn new(policy: SessionPolicy, initial_key_id: u32, now_us: u64) -> Self {
         Self {
@@ -92,10 +98,20 @@ impl SessionState {
     }
 
     pub fn should_rekey(&self, now_us: u64) -> bool {
-        self.pending_rekey.is_none()
-            && (self.bytes_on_active_key >= self.policy.rekey_bytes_threshold
-                || now_us.saturating_sub(self.active_key_since_us)
-                    >= self.policy.rekey_age_threshold_us)
+        self.rekey_reason(now_us).is_some()
+    }
+
+    pub fn rekey_reason(&self, now_us: u64) -> Option<RekeyReason> {
+        if self.pending_rekey.is_some() {
+            return None;
+        }
+        if self.bytes_on_active_key >= self.policy.rekey_bytes_threshold {
+            return Some(RekeyReason::Bytes);
+        }
+        if now_us.saturating_sub(self.active_key_since_us) >= self.policy.rekey_age_threshold_us {
+            return Some(RekeyReason::Age);
+        }
+        None
     }
 
     pub fn on_bytes_sent(&mut self, bytes: usize) {
@@ -165,6 +181,18 @@ impl SessionState {
             Some(grace) if grace.key_id == key_id && now_us <= grace.until_us => true,
             _ => false,
         }
+    }
+
+    pub fn switch_to_remote_key(&mut self, new_key_id: u32, now_us: u64) {
+        let old_key = self.active_key_id;
+        self.active_key_id = new_key_id;
+        self.active_key_since_us = now_us;
+        self.bytes_on_active_key = 0;
+        self.pending_rekey = None;
+        self.previous_key_grace = Some(PreviousKeyGrace {
+            key_id: old_key,
+            until_us: now_us.saturating_add(self.policy.grace_window_us),
+        });
     }
 
     pub fn track_ping(&mut self, request_id: u64, now_us: u64) -> Ping {

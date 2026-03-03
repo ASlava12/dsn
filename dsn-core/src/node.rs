@@ -1,13 +1,14 @@
 use crate::config::AddressMode as ConfigAddressMode;
 use crate::transport::AddressMode as HsAddressMode;
 use crate::{
-    ControlMessage, ControlMsgType, ControlPing, ControlPong, DhtRuntime, DsnConfig, MuxConfig,
-    PeerLinks, PeerLinksMode, SessionPolicy, SessionState, TransportEndpoint,
+    ControlMessage, ControlMsgType, ControlPing, ControlPong, ControlSessionChangeAck,
+    ControlSessionChangeRequest, DhtRuntime, DsnConfig, MuxConfig, PeerLinks, PeerLinksMode,
+    REKEY_ACK_OK, REKEY_ACK_REJECTED, RekeyReason, SessionPolicy, SessionState, TransportEndpoint,
     publish_public_identity, transport_for_scheme,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock, watch};
 use tokio::task::JoinHandle;
+use tracing::info;
 
 use crate::{
     HANDSHAKE_V1_VERSION, HandshakeConfig, SessionKeys, build_client_hello, handle_client_hello,
@@ -31,6 +33,10 @@ pub struct RuntimeStats {
     pub bootstrap_peers: usize,
     pub active_sessions: usize,
     pub published_identities: u64,
+    pub rekey_started: u64,
+    pub rekey_completed: u64,
+    pub rekey_by_bytes: u64,
+    pub rekey_by_age: u64,
 }
 
 struct ReplayWindow {
@@ -79,9 +85,17 @@ impl ReplayWindow {
 struct PeerRuntime {
     links: Arc<PeerLinks>,
     session: Arc<Mutex<SessionState>>,
-    keys: SessionKeys,
+    keys: Arc<Mutex<SessionKeys>>,
     replay: Arc<Mutex<ReplayWindow>>,
     send_seq: AtomicU64,
+    peer_verify_key: VerifyingKey,
+    pending_rekey: Arc<Mutex<Option<PendingRekeyKeys>>>,
+}
+
+struct PendingRekeyKeys {
+    request_id: u64,
+    new_key_id: u32,
+    keys: SessionKeys,
 }
 
 pub struct NodeRuntime {
@@ -120,6 +134,10 @@ impl NodeRuntime {
                 bootstrap_peers: cfg.bootstrap_peers.len(),
                 active_sessions: 0,
                 published_identities: 0,
+                rekey_started: 0,
+                rekey_completed: 0,
+                rekey_by_bytes: 0,
+                rekey_by_age: 0,
             })),
             signing,
             verifying,
@@ -279,6 +297,7 @@ async fn handshake_and_build_peer(
     outbound: bool,
 ) -> Result<Arc<PeerRuntime>> {
     let keys;
+    let peer_verify_key;
     if outbound {
         let cfg = handshake_config(&runtime);
         let (client_state, hello) = build_client_hello(&runtime.signing, cfg)?;
@@ -294,6 +313,7 @@ async fn handshake_and_build_peer(
             handle_server_hello(client_state, &server_hello, &server_vk)?;
         write_finished(&mut stream, &finished).await?;
         keys = session_keys;
+        peer_verify_key = server_vk;
     } else {
         let mut remote_vk = [0u8; 32];
         stream.read_exact(&mut remote_vk).await?;
@@ -311,6 +331,7 @@ async fn handshake_and_build_peer(
         let finished = read_finished(&mut stream).await?;
         verify_finished(&server_state, &finished)?;
         keys = server_session_keys(&server_state);
+        peer_verify_key = client_vk;
     }
 
     let links = Arc::new(PeerLinks::single_mux(stream, MuxConfig::default()));
@@ -321,9 +342,11 @@ async fn handshake_and_build_peer(
             1,
             now_us(),
         ))),
-        keys,
+        keys: Arc::new(Mutex::new(keys)),
         replay: Arc::new(Mutex::new(ReplayWindow::new())),
         send_seq: AtomicU64::new(1),
+        peer_verify_key,
+        pending_rekey: Arc::new(Mutex::new(None)),
     });
     Ok(peer)
 }
@@ -337,14 +360,15 @@ async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, p
         };
 
         let now = now_us();
-        let mut sess = peer.session.lock().await;
+        let sess = peer.session.lock().await;
         if !sess.can_accept_key_id(enc.key_id, now) {
             continue;
         }
         if !peer.replay.lock().await.accept(enc.seq) {
             continue;
         }
-        let plain = match crate::decrypt_frame(&peer.keys, &enc, &aad) {
+        let keys = { peer.keys.lock().await.clone() };
+        let plain = match crate::decrypt_frame(&keys, &enc, &aad) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -354,7 +378,6 @@ async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, p
         {
             handle_control_message(runtime.clone(), peer.clone(), msg).await;
         }
-        sess.on_bytes_sent(frame.payload.len());
     }
 
     runtime.peers.write().await.remove(&peer_key);
@@ -383,8 +406,95 @@ async fn handle_control_message(
                 now_us(),
             );
         }
+        ControlMessage::SessionChangeRequest(req) => {
+            handle_rekey_request(runtime, peer, req).await;
+        }
+        ControlMessage::SessionChangeAck(ack) => {
+            handle_rekey_ack(runtime, peer, ack).await;
+        }
         _ => {}
     }
+}
+
+async fn handle_rekey_request(
+    runtime: Arc<NodeRuntime>,
+    peer: Arc<PeerRuntime>,
+    req: ControlSessionChangeRequest,
+) {
+    let mut status = REKEY_ACK_OK;
+    if req.requester_node_id != runtime.node_id {
+        let sig_payload = rekey_signature_payload(req.request_id, req.new_key_id, &req.kem_payload);
+        let parsed_sig = ed25519_dalek::Signature::from_slice(&req.sign);
+        if parsed_sig
+            .ok()
+            .and_then(|sig| peer.peer_verify_key.verify(&sig_payload, &sig).ok())
+            .is_none()
+        {
+            status = REKEY_ACK_REJECTED;
+        }
+    } else {
+        status = REKEY_ACK_REJECTED;
+    }
+
+    if status == REKEY_ACK_OK {
+        let current = { peer.keys.lock().await.clone() };
+        let new_keys = derive_rekey_keys(
+            &current,
+            req.new_key_id,
+            req.request_id,
+            &req.kem_payload,
+            req.requester_node_id,
+            runtime.node_id,
+        );
+        {
+            let mut keys_guard = peer.keys.lock().await;
+            *keys_guard = new_keys;
+        }
+        let mut session = peer.session.lock().await;
+        session.switch_to_remote_key(req.new_key_id, now_us());
+    }
+
+    let ack = ControlMessage::SessionChangeAck(ControlSessionChangeAck {
+        request_id: req.request_id,
+        key_id: req.new_key_id,
+        status,
+    });
+    let _ = send_control(peer, ack).await;
+}
+
+async fn handle_rekey_ack(
+    runtime: Arc<NodeRuntime>,
+    peer: Arc<PeerRuntime>,
+    ack: ControlSessionChangeAck,
+) {
+    if ack.status != REKEY_ACK_OK {
+        return;
+    }
+
+    let pending = { peer.pending_rekey.lock().await.take() };
+    let Some(pending) = pending else {
+        return;
+    };
+    if pending.request_id != ack.request_id || pending.new_key_id != ack.key_id {
+        return;
+    }
+
+    {
+        let mut session = peer.session.lock().await;
+        let _ = session.handle_session_change_ack(
+            crate::SessionChangeAck {
+                request_id: ack.request_id,
+                accepted_key_id: ack.key_id,
+            },
+            now_us(),
+        );
+    }
+    {
+        let mut keys = peer.keys.lock().await;
+        *keys = pending.keys;
+    }
+    let mut stats = runtime.stats.lock().await;
+    stats.rekey_completed = stats.rekey_completed.saturating_add(1);
 }
 
 async fn send_control(peer: Arc<PeerRuntime>, msg: ControlMessage) -> Result<()> {
@@ -393,7 +503,8 @@ async fn send_control(peer: Arc<PeerRuntime>, msg: ControlMessage) -> Result<()>
     let seq = peer.send_seq.fetch_add(1, Ordering::Relaxed);
     let key_id = peer.session.lock().await.active_key_id();
     let aad = build_aad(crate::FrameClass::Control as u8, frame_msg_type, 0);
-    let enc = crate::encrypt_frame(&peer.keys, key_id, seq, &payload, &aad)?;
+    let keys = { peer.keys.lock().await.clone() };
+    let enc = crate::encrypt_frame(&keys, key_id, seq, &payload, &aad)?;
     let framed_payload = encode_encrypted_payload(&enc);
     peer.links
         .send_control(frame_msg_type, 0, framed_payload)
@@ -453,13 +564,51 @@ async fn run_rekey_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver
                 let now = now_us();
                 let peers = runtime.peers.read().await.values().cloned().collect::<Vec<_>>();
                 for peer in peers {
-                    let mut session = peer.session.lock().await;
-                    if session.should_rekey(now) {
-                        let next_key_id = session.active_key_id().saturating_add(1);
-                        let req = session.build_session_change_request(request_id, next_key_id, now);
+                    let rekey_plan = {
+                        let mut session = peer.session.lock().await;
+                        if let Some(reason) = session.rekey_reason(now) {
+                            let next_key_id = session.active_key_id().saturating_add(1);
+                            let req = session.build_session_change_request(request_id, next_key_id, now);
+                            Some((reason, req))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some((reason, req)) = rekey_plan {
+                        let kem_payload = build_rekey_kem_payload(request_id, now);
+                        let sign_payload = rekey_signature_payload(req.request_id, req.next_key_id, &kem_payload);
+                        let sign = runtime.signing.sign(&sign_payload).to_bytes().to_vec();
+                        let current_keys = { peer.keys.lock().await.clone() };
+                        let derived = derive_rekey_keys(
+                            &current_keys,
+                            req.next_key_id,
+                            req.request_id,
+                            &kem_payload,
+                            runtime.node_id,
+                            runtime.node_id,
+                        );
+                        *peer.pending_rekey.lock().await = Some(PendingRekeyKeys {
+                            request_id: req.request_id,
+                            new_key_id: req.next_key_id,
+                            keys: derived,
+                        });
+                        let control_req = ControlMessage::SessionChangeRequest(ControlSessionChangeRequest {
+                            request_id: req.request_id,
+                            new_key_id: req.next_key_id,
+                            requester_node_id: runtime.node_id,
+                            kem_payload,
+                            sign,
+                        });
+                        let _ = send_control(peer.clone(), control_req).await;
+                        let mut stats = runtime.stats.lock().await;
+                        stats.rekey_started = stats.rekey_started.saturating_add(1);
+                        match reason {
+                            RekeyReason::Bytes => stats.rekey_by_bytes = stats.rekey_by_bytes.saturating_add(1),
+                            RekeyReason::Age => stats.rekey_by_age = stats.rekey_by_age.saturating_add(1),
+                        }
+                        info!(request_id=req.request_id, next_key_id=req.next_key_id, ?reason, "session rekey started");
                         request_id = request_id.saturating_add(1);
-                        let ack = session.accept_session_change_request(req);
-                        let _ = session.handle_session_change_ack(ack, now.saturating_add(1));
                     }
                 }
                 runtime.stats.lock().await.last_tick_us = now;
@@ -560,6 +709,65 @@ fn control_frame_msg_type(msg: &ControlMessage) -> u16 {
         ControlMessage::Store(_) => ControlMsgType::Store as u16,
         ControlMessage::Delete(_) => ControlMsgType::Delete as u16,
         ControlMessage::NodeContact(_) => ControlMsgType::NodeContact as u16,
+        ControlMessage::SessionChangeRequest(_) => ControlMsgType::SessionChangeRequest as u16,
+        ControlMessage::SessionChangeAck(_) => ControlMsgType::SessionChangeAck as u16,
+    }
+}
+
+fn build_rekey_kem_payload(request_id: u64, now: u64) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(b"dsn-rekey-kem-v1");
+    h.update(&request_id.to_be_bytes());
+    h.update(&now.to_be_bytes());
+    h.finalize().as_bytes().to_vec()
+}
+
+fn rekey_signature_payload(request_id: u64, new_key_id: u32, kem_payload: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64 + kem_payload.len());
+    payload.extend_from_slice(b"dsn-session-change-request-v1");
+    payload.extend_from_slice(&request_id.to_be_bytes());
+    payload.extend_from_slice(&new_key_id.to_be_bytes());
+    payload.extend_from_slice(kem_payload);
+    payload
+}
+
+fn derive_rekey_keys(
+    current: &SessionKeys,
+    new_key_id: u32,
+    request_id: u64,
+    kem_payload: &[u8],
+    requester_node_id: [u8; 32],
+    local_node_id: [u8; 32],
+) -> SessionKeys {
+    let mut h = blake3::Hasher::new();
+    h.update(b"dsn-rekey-derive-v1");
+    h.update(&current.send_key);
+    h.update(&current.recv_key);
+    h.update(&new_key_id.to_be_bytes());
+    h.update(&request_id.to_be_bytes());
+    h.update(&requester_node_id);
+    h.update(kem_payload);
+    let seed = *h.finalize().as_bytes();
+
+    let mut a2b_h = blake3::Hasher::new();
+    a2b_h.update(b"dsn-rekey-a2b");
+    a2b_h.update(&seed);
+    let mut b2a_h = blake3::Hasher::new();
+    b2a_h.update(b"dsn-rekey-b2a");
+    b2a_h.update(&seed);
+    let a2b = *a2b_h.finalize().as_bytes();
+    let b2a = *b2a_h.finalize().as_bytes();
+
+    if local_node_id == requester_node_id {
+        SessionKeys {
+            send_key: a2b,
+            recv_key: b2a,
+        }
+    } else {
+        SessionKeys {
+            send_key: b2a,
+            recv_key: a2b,
+        }
     }
 }
 
