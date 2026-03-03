@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dht;
 pub mod identity;
 pub mod transport;
 
@@ -10,6 +11,8 @@ pub use config::{
     save_config_value, validate_config,
 };
 pub use identity::generate_identity;
+
+pub use dht::{DhtRecord, DhtRuntime};
 
 pub use transport::{
     AddressMode, AsyncReadWrite, BoxedStreamConn, CONTROL_PROTOCOL_V1, ClientHandshakeState,
