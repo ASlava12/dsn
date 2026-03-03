@@ -1,6 +1,7 @@
 pub mod config;
 pub mod dht;
 pub mod identity;
+pub mod node;
 pub mod transport;
 
 pub use config::format::ConfigFormat;
@@ -15,6 +16,7 @@ pub use identity::{
 };
 
 pub use dht::{DhtRecord, DhtRuntime, PUBLICATION_TTL_US};
+pub use node::{NodeRuntime, RuntimeStats};
 
 pub use transport::{
     AddressMode, AsyncReadWrite, BoxedStreamConn, CONTROL_PROTOCOL_V1, ClientHandshakeState,
