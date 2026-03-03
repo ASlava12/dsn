@@ -52,6 +52,8 @@ pub struct Pong {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindNode {
     pub request_id: u64,
+    pub flags: u16,
+    pub error_code: u16,
     pub namespace_id: u32,
     pub target_node_id: [u8; 32],
 }
@@ -59,6 +61,8 @@ pub struct FindNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindValue {
     pub request_id: u64,
+    pub flags: u16,
+    pub error_code: u16,
     pub namespace_id: u32,
     pub key: Vec<u8>,
 }
@@ -166,16 +170,16 @@ impl ControlMessage {
             }
             Self::FindNode(msg) => {
                 out.push(ControlMsgType::FindNode as u8);
-                put_u16(&mut out, 0);
-                put_u16(&mut out, 0);
+                put_u16(&mut out, msg.flags);
+                put_u16(&mut out, msg.error_code);
                 put_u64(&mut out, msg.request_id);
                 put_u32(&mut out, msg.namespace_id);
                 out.extend_from_slice(&msg.target_node_id);
             }
             Self::FindValue(msg) => {
                 out.push(ControlMsgType::FindValue as u8);
-                put_u16(&mut out, 0);
-                put_u16(&mut out, 0);
+                put_u16(&mut out, msg.flags);
+                put_u16(&mut out, msg.error_code);
                 put_u64(&mut out, msg.request_id);
                 put_u32(&mut out, msg.namespace_id);
                 put_u16(&mut out, msg.key.len() as u16);
@@ -271,6 +275,8 @@ impl ControlMessage {
                 let target_node_id = rd.read_fixed32()?;
                 Self::FindNode(FindNode {
                     request_id,
+                    flags,
+                    error_code,
                     namespace_id,
                     target_node_id,
                 })
@@ -280,6 +286,8 @@ impl ControlMessage {
                 let key = rd.read_vec_u16()?;
                 Self::FindValue(FindValue {
                     request_id,
+                    flags,
+                    error_code,
                     namespace_id,
                     key,
                 })
@@ -454,11 +462,15 @@ mod tests {
             }),
             ControlMessage::FindNode(FindNode {
                 request_id: 3,
+                flags: 0,
+                error_code: 0,
                 namespace_id: 10,
                 target_node_id: id(3),
             }),
             ControlMessage::FindValue(FindValue {
                 request_id: 4,
+                flags: 0,
+                error_code: 0,
                 namespace_id: 11,
                 key: b"key".to_vec(),
             }),

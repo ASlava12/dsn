@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -24,6 +24,11 @@ use crate::{
     HANDSHAKE_V1_VERSION, HandshakeConfig, SessionKeys, build_client_hello, handle_client_hello,
     handle_server_hello, server_session_keys, verify_finished,
 };
+
+const DHT_NAMESPACE_MAIN: u32 = 0;
+const DHT_FLAG_RESPONSE: u16 = 0x1;
+const DHT_MSG_TYPE_MIN: u16 = ControlMsgType::FindNode as u16;
+const DHT_MSG_TYPE_MAX: u16 = ControlMsgType::NodeContact as u16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeStats {
@@ -89,7 +94,44 @@ struct PeerRuntime {
     replay: Arc<Mutex<ReplayWindow>>,
     send_seq: AtomicU64,
     peer_verify_key: VerifyingKey,
+    peer_node_id: [u8; 32],
     pending_rekey: Arc<Mutex<Option<PendingRekeyKeys>>>,
+}
+
+struct DhtRequestManager {
+    pending_find_node: Mutex<HashMap<u64, oneshot::Sender<Vec<[u8; 32]>>>>,
+    next_request_id: AtomicU64,
+    rate_window_start_us: Mutex<u64>,
+    rate_counter: Mutex<u32>,
+}
+
+impl DhtRequestManager {
+    fn new() -> Self {
+        Self {
+            pending_find_node: Mutex::new(HashMap::new()),
+            next_request_id: AtomicU64::new(1_000_000),
+            rate_window_start_us: Mutex::new(0),
+            rate_counter: Mutex::new(0),
+        }
+    }
+
+    fn next_request_id(&self) -> u64 {
+        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn allow_send(&self, now_us: u64) -> bool {
+        let mut ws = self.rate_window_start_us.lock().await;
+        let mut cnt = self.rate_counter.lock().await;
+        if now_us.saturating_sub(*ws) > 1_000_000 {
+            *ws = now_us;
+            *cnt = 0;
+        }
+        if *cnt >= 64 {
+            return false;
+        }
+        *cnt += 1;
+        true
+    }
 }
 
 struct PendingRekeyKeys {
@@ -107,6 +149,7 @@ pub struct NodeRuntime {
     verifying: VerifyingKey,
     node_id: [u8; 32],
     peer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    dht_requests: Arc<DhtRequestManager>,
 }
 
 pub struct NodeRuntimeHandle {
@@ -115,6 +158,8 @@ pub struct NodeRuntimeHandle {
     stats: Arc<Mutex<RuntimeStats>>,
     dht: Arc<Mutex<DhtRuntime>>,
     peer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    peers: Arc<RwLock<HashMap<String, Arc<PeerRuntime>>>>,
+    dht_requests: Arc<DhtRequestManager>,
 }
 
 impl NodeRuntime {
@@ -143,6 +188,7 @@ impl NodeRuntime {
             verifying,
             node_id,
             peer_tasks: Arc::new(Mutex::new(Vec::new())),
+            dht_requests: Arc::new(DhtRequestManager::new()),
         }
     }
 
@@ -180,6 +226,8 @@ impl NodeRuntime {
             stats: shared.stats.clone(),
             dht: shared.dht.clone(),
             peer_tasks: shared.peer_tasks.clone(),
+            peers: shared.peers.clone(),
+            dht_requests: shared.dht_requests.clone(),
         }
     }
 }
@@ -201,6 +249,61 @@ impl NodeRuntimeHandle {
 
     pub fn dht(&self) -> Arc<Mutex<DhtRuntime>> {
         self.dht.clone()
+    }
+
+    pub async fn dht_find_node(&self, target_id: [u8; 32], max: usize) -> Result<Vec<[u8; 32]>> {
+        let peers = self.peers.read().await;
+        let Some(peer) = peers.values().next().cloned() else {
+            return Err(anyhow!("no active peers for dht query"));
+        };
+        drop(peers);
+
+        for _ in 0..=2 {
+            let now = now_us();
+            if !self.dht_requests.allow_send(now).await {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
+            let request_id = self.dht_requests.next_request_id();
+            let (tx, rx) = oneshot::channel();
+            self.dht_requests
+                .pending_find_node
+                .lock()
+                .await
+                .insert(request_id, tx);
+
+            let msg = ControlMessage::FindNode(crate::FindNode {
+                request_id,
+                flags: 0,
+                error_code: 0,
+                namespace_id: DHT_NAMESPACE_MAIN,
+                target_node_id: target_id,
+            });
+
+            if send_control(peer.clone(), msg).await.is_err() {
+                let _ = self
+                    .dht_requests
+                    .pending_find_node
+                    .lock()
+                    .await
+                    .remove(&request_id);
+                continue;
+            }
+
+            if let Ok(Ok(nodes)) = tokio::time::timeout(Duration::from_millis(800), rx).await {
+                return Ok(nodes.into_iter().take(max).collect());
+            }
+
+            let _ = self
+                .dht_requests
+                .pending_find_node
+                .lock()
+                .await
+                .remove(&request_id);
+        }
+
+        Err(anyhow!("dht FIND_NODE timeout after retries"))
     }
 }
 
@@ -298,6 +401,7 @@ async fn handshake_and_build_peer(
 ) -> Result<Arc<PeerRuntime>> {
     let keys;
     let peer_verify_key;
+    let peer_node_id;
     if outbound {
         let cfg = handshake_config(&runtime);
         let (client_state, hello) = build_client_hello(&runtime.signing, cfg)?;
@@ -314,6 +418,7 @@ async fn handshake_and_build_peer(
         write_finished(&mut stream, &finished).await?;
         keys = session_keys;
         peer_verify_key = server_vk;
+        peer_node_id = server_hello.config.node_id;
     } else {
         let mut remote_vk = [0u8; 32];
         stream.read_exact(&mut remote_vk).await?;
@@ -332,6 +437,7 @@ async fn handshake_and_build_peer(
         verify_finished(&server_state, &finished)?;
         keys = server_session_keys(&server_state);
         peer_verify_key = client_vk;
+        peer_node_id = client_hello.config.node_id;
     }
 
     let links = Arc::new(PeerLinks::single_mux(stream, MuxConfig::default()));
@@ -346,6 +452,7 @@ async fn handshake_and_build_peer(
         replay: Arc::new(Mutex::new(ReplayWindow::new())),
         send_seq: AtomicU64::new(1),
         peer_verify_key,
+        peer_node_id,
         pending_rekey: Arc::new(Mutex::new(None)),
     });
     Ok(peer)
@@ -360,9 +467,11 @@ async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, p
         };
 
         let now = now_us();
-        let sess = peer.session.lock().await;
-        if !sess.can_accept_key_id(enc.key_id, now) {
-            continue;
+        {
+            let sess = peer.session.lock().await;
+            if !sess.can_accept_key_id(enc.key_id, now) {
+                continue;
+            }
         }
         if !peer.replay.lock().await.accept(enc.seq) {
             continue;
@@ -412,8 +521,118 @@ async fn handle_control_message(
         ControlMessage::SessionChangeAck(ack) => {
             handle_rekey_ack(runtime, peer, ack).await;
         }
-        _ => {}
+        ControlMessage::FindNode(msg) => {
+            handle_dht_find_node(runtime, peer, msg).await;
+        }
+        ControlMessage::FindValue(msg) => {
+            handle_dht_find_value(runtime, peer, msg).await;
+        }
+        ControlMessage::Store(msg) => {
+            handle_dht_store(runtime, peer, msg).await;
+        }
+        ControlMessage::Delete(msg) => {
+            handle_dht_delete(runtime, peer, msg).await;
+        }
+        ControlMessage::NodeContact(msg) => {
+            handle_dht_node_contact(runtime, msg).await;
+        }
     }
+}
+
+async fn handle_dht_find_node(
+    runtime: Arc<NodeRuntime>,
+    peer: Arc<PeerRuntime>,
+    msg: crate::FindNode,
+) {
+    runtime.dht.lock().await.add_known_node(peer.peer_node_id);
+
+    if msg.flags & DHT_FLAG_RESPONSE != 0 {
+        if let Some(tx) = runtime
+            .dht_requests
+            .pending_find_node
+            .lock()
+            .await
+            .remove(&msg.request_id)
+        {
+            let _ = tx.send(vec![msg.target_node_id]);
+        }
+        return;
+    }
+
+    let nearest = runtime.dht.lock().await.find_node(msg.target_node_id, 1);
+    let response_id = nearest.first().copied().unwrap_or([0u8; 32]);
+    let response = ControlMessage::FindNode(crate::FindNode {
+        request_id: msg.request_id,
+        flags: DHT_FLAG_RESPONSE,
+        error_code: 0,
+        namespace_id: msg.namespace_id,
+        target_node_id: response_id,
+    });
+    let _ = send_control(peer, response).await;
+}
+
+async fn handle_dht_find_value(
+    runtime: Arc<NodeRuntime>,
+    peer: Arc<PeerRuntime>,
+    msg: crate::FindValue,
+) {
+    runtime.dht.lock().await.add_known_node(peer.peer_node_id);
+    if msg.flags & DHT_FLAG_RESPONSE == 0 {
+        let value = runtime
+            .dht
+            .lock()
+            .await
+            .find_value("main", &msg.key)
+            .unwrap_or_default();
+        let response = ControlMessage::Store(crate::Store {
+            request_id: msg.request_id,
+            namespace_id: msg.namespace_id,
+            flags: DHT_FLAG_RESPONSE,
+            error_code: 0,
+            key: msg.key,
+            value,
+            signature: Vec::new(),
+        });
+        let _ = send_control(peer, response).await;
+    }
+}
+
+async fn handle_dht_store(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, msg: crate::Store) {
+    runtime.dht.lock().await.add_known_node(peer.peer_node_id);
+    if msg.flags & DHT_FLAG_RESPONSE == 0 {
+        runtime.dht.lock().await.store("main", msg.key, msg.value);
+        let ack = ControlMessage::Store(crate::Store {
+            request_id: msg.request_id,
+            namespace_id: msg.namespace_id,
+            flags: DHT_FLAG_RESPONSE,
+            error_code: 0,
+            key: Vec::new(),
+            value: Vec::new(),
+            signature: Vec::new(),
+        });
+        let _ = send_control(peer, ack).await;
+    }
+}
+
+async fn handle_dht_delete(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, msg: crate::Delete) {
+    runtime.dht.lock().await.add_known_node(peer.peer_node_id);
+    if msg.flags & DHT_FLAG_RESPONSE == 0 {
+        let _ = runtime.dht.lock().await.delete("main", &msg.key);
+        let ack = ControlMessage::Delete(crate::Delete {
+            request_id: msg.request_id,
+            namespace_id: msg.namespace_id,
+            flags: DHT_FLAG_RESPONSE,
+            error_code: 0,
+            key: Vec::new(),
+            value: Vec::new(),
+            signature: Vec::new(),
+        });
+        let _ = send_control(peer, ack).await;
+    }
+}
+
+async fn handle_dht_node_contact(runtime: Arc<NodeRuntime>, msg: crate::NodeContact) {
+    runtime.dht.lock().await.add_known_node(msg.node_id_contact);
 }
 
 async fn handle_rekey_request(
@@ -701,7 +920,7 @@ fn build_aad(class: u8, msg_type: u16, flags: u16) -> Vec<u8> {
 }
 
 fn control_frame_msg_type(msg: &ControlMessage) -> u16 {
-    match msg {
+    let msg_type = match msg {
         ControlMessage::Ping(_) => ControlMsgType::Ping as u16,
         ControlMessage::Pong(_) => ControlMsgType::Pong as u16,
         ControlMessage::FindNode(_) => ControlMsgType::FindNode as u16,
@@ -711,7 +930,19 @@ fn control_frame_msg_type(msg: &ControlMessage) -> u16 {
         ControlMessage::NodeContact(_) => ControlMsgType::NodeContact as u16,
         ControlMessage::SessionChangeRequest(_) => ControlMsgType::SessionChangeRequest as u16,
         ControlMessage::SessionChangeAck(_) => ControlMsgType::SessionChangeAck as u16,
-    }
+    };
+    debug_assert!(
+        !(DHT_MSG_TYPE_MIN..=DHT_MSG_TYPE_MAX).contains(&msg_type)
+            || matches!(
+                msg,
+                ControlMessage::FindNode(_)
+                    | ControlMessage::FindValue(_)
+                    | ControlMessage::Store(_)
+                    | ControlMessage::Delete(_)
+                    | ControlMessage::NodeContact(_)
+            )
+    );
+    msg_type
 }
 
 fn build_rekey_kem_payload(request_id: u64, now: u64) -> Vec<u8> {
@@ -961,6 +1192,38 @@ mod tests {
         let stats_b = node_b.snapshot().await;
         assert!(stats_a.active_sessions >= 1);
         assert!(stats_b.active_sessions >= 1);
+
+        node_a.stop().await;
+        node_b.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_node_request_goes_over_network_with_retries_timeouts_manager() -> Result<()> {
+        let mut cfg_a = DsnConfig::default_with_generated_identity()?;
+        let mut cfg_b = DsnConfig::default_with_generated_identity()?;
+
+        cfg_a.listen = vec!["tcp://127.0.0.1:19281".parse()?];
+        cfg_b.listen = vec!["tcp://127.0.0.1:19282".parse()?];
+        cfg_a.bootstrap_peers = vec!["tcp://127.0.0.1:19282".parse()?];
+        cfg_b.bootstrap_peers = vec!["tcp://127.0.0.1:19281".parse()?];
+
+        let target = [0x42; 32];
+
+        let node_a = NodeRuntime::new(cfg_a).start();
+        let node_b = NodeRuntime::new(cfg_b).start();
+
+        {
+            let dht_b = node_b.dht();
+            let mut dht = dht_b.lock().await;
+            dht.add_known_node(target);
+        }
+
+        sleep(Duration::from_secs(8)).await;
+
+        let got = node_a.dht_find_node(target, 1).await?;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], target);
 
         node_a.stop().await;
         node_b.stop().await;
