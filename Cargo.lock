@@ -603,6 +603,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-rustls",
+ "ipnet",
  "pqcrypto-mlkem",
  "pqcrypto-traits",
  "prost",
