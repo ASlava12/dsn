@@ -15,7 +15,6 @@ use crate::cmd::cli::NodeCommands;
 struct DhtCliState {
     ip4_enabled: bool,
     ip6_enabled: bool,
-    names: HashMap<String, String>,
 }
 
 pub async fn handle(command: NodeCommands, explicit_config: Option<PathBuf>) -> Result<()> {
@@ -129,6 +128,7 @@ async fn run_foreground(
 
     let cfg = load_runtime_config(explicit_config.as_deref())?;
     let control_sock_path = control_socket_path(&cfg, &state_dir);
+    let name_registry_path = name_registry_path(explicit_config.as_deref())?;
     let runtime = NodeRuntime::new(cfg.clone());
     let handle = runtime.start();
     let dht = handle.dht();
@@ -142,6 +142,7 @@ async fn run_foreground(
         dht,
         cfg.identity.id.clone(),
         cli_state,
+        name_registry_path,
     ));
 
     fs::write(&pid_path, std::process::id().to_string()).await?;
@@ -209,6 +210,12 @@ fn control_socket_path(cfg: &DsnConfig, state_dir: &Path) -> PathBuf {
     }
 }
 
+fn name_registry_path(explicit_config: Option<&Path>) -> Result<PathBuf> {
+    let cfg_path = resolve_config_path(explicit_config)?;
+    let base = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(base.join(".dsn-name-registry.json"))
+}
+
 fn load_runtime_config(explicit_config: Option<&Path>) -> Result<DsnConfig> {
     let path = resolve_config_path(explicit_config)?;
     if !path.exists() {
@@ -256,17 +263,127 @@ async fn read_status(path: &Path) -> Result<PersistedStatus> {
     Ok(serde_json::from_slice(&raw)?)
 }
 
+async fn load_name_registry(path: &Path) -> Result<HashMap<String, String>> {
+    let Ok(raw) = fs::read(path).await else {
+        return Ok(HashMap::new());
+    };
+    if raw.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+async fn save_name_registry(path: &Path, names: &HashMap<String, String>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let payload = serde_json::to_vec(names)?;
+    fs::write(path, payload).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::state_dir_for;
+    use super::{DhtCliState, handle_dht_admin_request, state_dir_for};
     use anyhow::Result;
+    use dsn_core::DhtRuntime;
     use std::path::Path;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn state_dir_is_adjacent_to_config() -> Result<()> {
         let dir = state_dir_for(Some(Path::new("/tmp/dsn/config.toml")), None)?;
         assert_eq!(dir, Path::new("/tmp/dsn/node-state"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn name_commands_are_backed_by_dht_runtime() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "dsn-name-registry-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let dht = Arc::new(Mutex::new(DhtRuntime::new([1; 32], true)));
+        let cli_state = Arc::new(Mutex::new(DhtCliState::default()));
+
+        let take = handle_dht_admin_request(
+            "name take test",
+            dht.clone(),
+            "node-a",
+            cli_state.clone(),
+            &registry_path,
+        )
+        .await;
+        assert_eq!(take.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let get = handle_dht_admin_request(
+            "name get test",
+            dht.clone(),
+            "node-a",
+            cli_state.clone(),
+            &registry_path,
+        )
+        .await;
+        assert_eq!(get.get("owner").and_then(|v| v.as_str()), Some("node-a"));
+
+        let check = handle_dht_admin_request(
+            "name check test",
+            dht.clone(),
+            "node-a",
+            cli_state.clone(),
+            &registry_path,
+        )
+        .await;
+        assert_eq!(
+            check.get("available").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let dht_guard = dht.lock().await;
+        assert_eq!(
+            dht_guard.find_value("name", b"test").as_deref(),
+            Some(b"node-a".as_slice())
+        );
+
+        let _ = tokio::fs::remove_file(&registry_path).await;
+    }
+
+    #[tokio::test]
+    async fn name_get_can_read_persisted_registry() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "dsn-name-registry-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let mut names = std::collections::HashMap::new();
+        names.insert("shared".to_string(), "node-z".to_string());
+        tokio::fs::write(
+            &registry_path,
+            serde_json::to_vec(&names).expect("serialize"),
+        )
+        .await
+        .expect("write");
+
+        let dht = Arc::new(Mutex::new(DhtRuntime::new([1; 32], true)));
+        let cli_state = Arc::new(Mutex::new(DhtCliState::default()));
+
+        let get =
+            handle_dht_admin_request("name get shared", dht, "node-a", cli_state, &registry_path)
+                .await;
+
+        assert_eq!(get.get("owner").and_then(|v| v.as_str()), Some("node-z"));
+
+        let _ = tokio::fs::remove_file(&registry_path).await;
     }
 }
 
@@ -275,6 +392,7 @@ async fn run_control_socket_server(
     dht: std::sync::Arc<Mutex<dsn_core::DhtRuntime>>,
     my_id: String,
     cli_state: std::sync::Arc<Mutex<DhtCliState>>,
+    registry_path: PathBuf,
 ) -> Result<()> {
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("failed to bind control socket {}", sock_path.display()))?;
@@ -284,13 +402,17 @@ async fn run_control_socket_server(
         let dht = dht.clone();
         let my_id = my_id.clone();
         let cli_state = cli_state.clone();
+        let registry_path = registry_path.clone();
         tokio::spawn(async move {
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
             let mut line = String::new();
             let response = match reader.read_line(&mut line).await {
                 Ok(0) => serde_json::json!({"error":"empty request"}),
-                Ok(_) => handle_dht_admin_request(line.trim(), dht, &my_id, cli_state).await,
+                Ok(_) => {
+                    handle_dht_admin_request(line.trim(), dht, &my_id, cli_state, &registry_path)
+                        .await
+                }
                 Err(e) => serde_json::json!({"error": format!("io error: {e}")}),
             };
             let _ = write_half
@@ -305,6 +427,7 @@ async fn handle_dht_admin_request(
     dht: std::sync::Arc<Mutex<dsn_core::DhtRuntime>>,
     my_id: &str,
     cli_state: std::sync::Arc<Mutex<DhtCliState>>,
+    registry_path: &Path,
 ) -> serde_json::Value {
     let parts: Vec<&str> = request.split_whitespace().collect();
     if parts.is_empty() {
@@ -359,24 +482,49 @@ async fn handle_dht_admin_request(
             }
         }
         ["name", "check", name] => {
-            let st = cli_state.lock().await;
-            serde_json::json!({"available": !st.names.contains_key(*name)})
+            let dht_has_name = {
+                let guard = dht.lock().await;
+                guard.find_value("name", name.as_bytes()).is_some()
+            };
+            let registry = load_name_registry(registry_path).await.unwrap_or_default();
+            let available = !dht_has_name && !registry.contains_key(*name);
+            serde_json::json!({"available": available})
         }
         ["name", "get", name] => {
-            let st = cli_state.lock().await;
-            match st.names.get(*name) {
+            let local_owner = {
+                let guard = dht.lock().await;
+                guard
+                    .find_value("name", name.as_bytes())
+                    .and_then(|v| String::from_utf8(v).ok())
+            };
+
+            if let Some(owner) = local_owner {
+                return serde_json::json!({"name":name,"owner":owner});
+            }
+
+            let registry = load_name_registry(registry_path).await.unwrap_or_default();
+            match registry.get(*name) {
                 Some(owner) => serde_json::json!({"name":name,"owner":owner}),
                 None => serde_json::json!({"error":"not found"}),
             }
         }
         ["name", "take", name] => {
-            let mut st = cli_state.lock().await;
-            if st.names.contains_key(*name) {
-                serde_json::json!({"error":"name is already taken"})
-            } else {
-                st.names.insert((*name).to_string(), my_id.to_string());
-                serde_json::json!({"ok":true,"name":name,"owner":my_id})
+            let mut guard = dht.lock().await;
+            if guard.find_value("name", name.as_bytes()).is_some() {
+                return serde_json::json!({"error":"name is already taken"});
             }
+
+            let mut registry = load_name_registry(registry_path).await.unwrap_or_default();
+            if registry.contains_key(*name) {
+                return serde_json::json!({"error":"name is already taken"});
+            }
+
+            guard.store("name", name.as_bytes().to_vec(), my_id.as_bytes().to_vec());
+            registry.insert((*name).to_string(), my_id.to_string());
+            if let Err(err) = save_name_registry(registry_path, &registry).await {
+                return serde_json::json!({"error": format!("failed to persist names: {err}")});
+            }
+            serde_json::json!({"ok":true,"name":name,"owner":my_id})
         }
         ["name", "challenge", name, difficulty] => {
             let diff = difficulty.parse::<u8>().unwrap_or(8);
