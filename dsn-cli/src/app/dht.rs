@@ -64,5 +64,18 @@ async fn query_control_socket(explicit_config: Option<&Path>, request: &str) -> 
 fn control_socket_path(explicit_config: Option<&Path>) -> Result<PathBuf> {
     let cfg_path = dsn_core::resolve_config_path(explicit_config)?;
     let base = cfg_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(base.join("node-state").join("control.sock"))
+
+    let cfg = if cfg_path.exists() {
+        dsn_core::load_config(&cfg_path)?
+    } else {
+        dsn_core::DsnConfig::default_with_generated_identity()?
+    };
+
+    let state_dir = base.join(&cfg.node.state_dir);
+    let sock = Path::new(&cfg.node.control_socket);
+    Ok(if sock.is_absolute() {
+        sock.to_path_buf()
+    } else {
+        state_dir.join(sock)
+    })
 }

@@ -31,6 +31,31 @@ pub enum AddressMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    #[serde(default = "default_state_dir")]
+    pub state_dir: String,
+    #[serde(default = "default_control_socket")]
+    pub control_socket: String,
+}
+
+fn default_state_dir() -> String {
+    "node-state".to_string()
+}
+
+fn default_control_socket() -> String {
+    "control.sock".to_string()
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: default_state_dir(),
+            control_socket: default_control_socket(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DsnConfig {
     #[serde(default)]
     pub participate_in_dht: bool,
@@ -56,6 +81,9 @@ pub struct DsnConfig {
 
     #[serde(default)]
     pub ip6_exclude_net: Vec<String>,
+
+    #[serde(default)]
+    pub node: NodeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +106,7 @@ impl DsnConfig {
             ip4_exclude_net: Vec::new(),
             ip6_include_net: Vec::new(),
             ip6_exclude_net: Vec::new(),
+            node: NodeConfig::default(),
         })
     }
 
@@ -121,7 +150,50 @@ impl DsnConfig {
 
         self.validate_transport_endpoints()?;
         self.validate_address_filters()?;
+        self.validate_node_paths()?;
 
+        Ok(())
+    }
+
+    pub fn is_allowed_ipv4(&self, addr: Ipv4Addr) -> bool {
+        let include = parse_ipv4_nets(&self.ip4_include_net).ok();
+        let exclude = parse_ipv4_nets(&self.ip4_exclude_net).ok();
+
+        match (include, exclude) {
+            (Some(include), Some(exclude)) => {
+                is_allowed_ipv4(addr, self.address_mode, &include, &exclude)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_allowed_ipv6(&self, addr: Ipv6Addr) -> bool {
+        let include = parse_ipv6_nets(&self.ip6_include_net).ok();
+        let exclude = parse_ipv6_nets(&self.ip6_exclude_net).ok();
+
+        match (include, exclude) {
+            (Some(include), Some(exclude)) => {
+                is_allowed_ipv6(addr, self.address_mode, &include, &exclude)
+            }
+            _ => false,
+        }
+    }
+
+    fn validate_address_filters(&self) -> Result<()> {
+        parse_ipv4_nets(&self.ip4_include_net)?;
+        parse_ipv4_nets(&self.ip4_exclude_net)?;
+        parse_ipv6_nets(&self.ip6_include_net)?;
+        parse_ipv6_nets(&self.ip6_exclude_net)?;
+        Ok(())
+    }
+
+    fn validate_node_paths(&self) -> Result<()> {
+        if self.node.state_dir.trim().is_empty() {
+            bail!("node.state_dir must not be empty");
+        }
+        if self.node.control_socket.trim().is_empty() {
+            bail!("node.control_socket must not be empty");
+        }
         Ok(())
     }
 
@@ -717,6 +789,32 @@ mod tests {
             let ip = raw.parse().expect("ipv6 parse");
             assert_eq!(cfg.is_allowed_ipv6(ip), expected, "ip={raw}");
         }
+    }
+
+    #[test]
+    fn yaml_listen_as_string_endpoints_deserializes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dsn-yaml-endpoint-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let path = base.join("config.yaml");
+
+        let id = generate_identity("ed25519").expect("identity");
+        let raw = format!(
+            "address_mode: public_only\nparticipate_in_dht: false\nidentity:\n  algo: {}\n  id: {}\n  private_key: {}\n  public_key: {}\nlisten:\n  - udp://127.0.0.2:9990\nbootstrap_peers: []\nip4_include_net: []\nip4_exclude_net: []\nip6_include_net: []\nip6_exclude_net: []\n",
+            id.algo, id.id, id.private_key, id.public_key
+        );
+        fs::write(&path, raw).expect("write config");
+
+        let cfg = load_config(&path).expect("yaml with string endpoints should load");
+        assert_eq!(cfg.listen.len(), 1);
+        assert_eq!(cfg.listen[0].scheme, crate::transport::TransportScheme::Udp);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

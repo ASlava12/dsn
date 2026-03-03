@@ -39,13 +39,22 @@ pub struct NodeArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum NodeCommands {
-    Up,
-    Down,
-    Status,
+    Up {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    Down {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     #[command(hide = true, name = "run")]
     Run {
         #[arg(long)]
-        state_dir: PathBuf,
+        state_dir: Option<PathBuf>,
     },
 }
 

@@ -139,5 +139,9 @@ fn bootstrap_handshake_ping_mesh_store_find_rekey_publish() {
     cfg.identity = ida.clone();
     let published = publish_public_identity(&cfg, &mut dht_a, &ida, 1, 1, 5_000).expect("publish");
     assert_eq!(published.id, ida.id);
-    assert!(dht_a.find_value_at("main", ida.id.as_bytes(), 5_000).is_some());
+    assert!(
+        dht_a
+            .find_value_at("main", ida.id.as_bytes(), 5_000)
+            .is_some()
+    );
 }

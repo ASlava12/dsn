@@ -20,15 +20,15 @@ struct DhtCliState {
 
 pub async fn handle(command: NodeCommands, explicit_config: Option<PathBuf>) -> Result<()> {
     match command {
-        NodeCommands::Up => up(explicit_config).await,
-        NodeCommands::Down => down(explicit_config).await,
-        NodeCommands::Status => status(explicit_config).await,
+        NodeCommands::Up { state_dir } => up(explicit_config, state_dir).await,
+        NodeCommands::Down { state_dir } => down(explicit_config, state_dir).await,
+        NodeCommands::Status { state_dir } => status(explicit_config, state_dir).await,
         NodeCommands::Run { state_dir } => run_foreground(explicit_config, state_dir).await,
     }
 }
 
-async fn up(explicit_config: Option<PathBuf>) -> Result<()> {
-    let state_dir = state_dir_for(explicit_config.as_deref())?;
+async fn up(explicit_config: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
+    let state_dir = state_dir_for(explicit_config.as_deref(), state_dir.as_deref())?;
     let pid_path = state_dir.join("node.pid");
 
     if let Some(pid) = read_pid(&pid_path).await?
@@ -38,7 +38,12 @@ async fn up(explicit_config: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(&state_dir).await?;
+    fs::create_dir_all(&state_dir).await.with_context(|| {
+        format!(
+            "failed to prepare state_dir {} (if this path is a file, choose directory path)",
+            state_dir.display()
+        )
+    })?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let mut cmd = std::process::Command::new(exe);
     if let Some(path) = explicit_config.as_ref() {
@@ -57,8 +62,8 @@ async fn up(explicit_config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn down(explicit_config: Option<PathBuf>) -> Result<()> {
-    let state_dir = state_dir_for(explicit_config.as_deref())?;
+async fn down(explicit_config: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
+    let state_dir = state_dir_for(explicit_config.as_deref(), state_dir.as_deref())?;
     let pid_path = state_dir.join("node.pid");
     let Some(pid) = read_pid(&pid_path).await? else {
         println!("node is not running");
@@ -85,8 +90,8 @@ async fn down(explicit_config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn status(explicit_config: Option<PathBuf>) -> Result<()> {
-    let state_dir = state_dir_for(explicit_config.as_deref())?;
+async fn status(explicit_config: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
+    let state_dir = state_dir_for(explicit_config.as_deref(), state_dir.as_deref())?;
     let pid_path = state_dir.join("node.pid");
     let stats_path = state_dir.join("status.json");
 
@@ -108,13 +113,22 @@ async fn status(explicit_config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn run_foreground(explicit_config: Option<PathBuf>, state_dir: PathBuf) -> Result<()> {
-    fs::create_dir_all(&state_dir).await?;
+async fn run_foreground(
+    explicit_config: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+) -> Result<()> {
+    let state_dir = state_dir_for(explicit_config.as_deref(), state_dir.as_deref())?;
+    fs::create_dir_all(&state_dir).await.with_context(|| {
+        format!(
+            "failed to prepare state_dir {} (if this path is a file, choose directory path)",
+            state_dir.display()
+        )
+    })?;
     let pid_path = state_dir.join("node.pid");
     let stats_path = state_dir.join("status.json");
-    let control_sock_path = state_dir.join("control.sock");
 
     let cfg = load_runtime_config(explicit_config.as_deref())?;
+    let control_sock_path = control_socket_path(&cfg, &state_dir);
     let runtime = NodeRuntime::new(cfg.clone());
     let handle = runtime.start();
     let dht = handle.dht();
@@ -172,10 +186,27 @@ async fn shutdown_signal() {
     }
 }
 
-fn state_dir_for(explicit_config: Option<&Path>) -> Result<PathBuf> {
+fn state_dir_for(
+    explicit_config: Option<&Path>,
+    override_state_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = override_state_dir {
+        return Ok(path.to_path_buf());
+    }
+
+    let cfg = load_runtime_config(explicit_config)?;
     let cfg_path = resolve_config_path(explicit_config)?;
     let base = cfg_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(base.join("node-state"))
+    Ok(base.join(&cfg.node.state_dir))
+}
+
+fn control_socket_path(cfg: &DsnConfig, state_dir: &Path) -> PathBuf {
+    let socket = Path::new(&cfg.node.control_socket);
+    if socket.is_absolute() {
+        socket.to_path_buf()
+    } else {
+        state_dir.join(socket)
+    }
 }
 
 fn load_runtime_config(explicit_config: Option<&Path>) -> Result<DsnConfig> {
@@ -233,7 +264,7 @@ mod tests {
 
     #[test]
     fn state_dir_is_adjacent_to_config() -> Result<()> {
-        let dir = state_dir_for(Some(Path::new("/tmp/dsn/config.toml")))?;
+        let dir = state_dir_for(Some(Path::new("/tmp/dsn/config.toml")), None)?;
         assert_eq!(dir, Path::new("/tmp/dsn/node-state"));
         Ok(())
     }

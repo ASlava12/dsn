@@ -78,7 +78,7 @@ services:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
 
   toxiproxy:
-    image: shopify/toxiproxy:2.11.0
+    image: ghcr.io/shopify/toxiproxy:2.12.0
     ports:
       - "8474:8474"
       - "4101:4101"
@@ -86,7 +86,7 @@ services:
       - "4103:4103"
 
   toxiproxy-init:
-    image: shopify/toxiproxy:2.11.0
+    image: ghcr.io/shopify/toxiproxy:2.12.0
     depends_on: [toxiproxy, node1, node2, node3]
     entrypoint: ["/bin/sh", "-c"]
     command: >

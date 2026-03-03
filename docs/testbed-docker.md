@@ -106,3 +106,19 @@ docker compose up -d --scale node=20
 - `node1..node3` остаются seed-нодами.
 - `node`-экземпляры автоматически используют bootstrap на `node1..node3`.
 - Пример статического конфига ноды: `testbed/docker/configs/node-dht-listen.toml`.
+
+
+## Параметры рантайма в конфиге
+
+Поддерживаются поля:
+
+```yaml
+node:
+  state_dir: node-state
+  control_socket: control.sock
+```
+
+- `state_dir` — директория runtime-состояния (`pid/status/control socket`),
+- `control_socket` — путь сокета (абсолютный или относительный от `state_dir`).
+
+CLI-команды `dsn node up/down/status/run` принимают `--state-dir` как override поверх конфига.
