@@ -197,38 +197,6 @@ impl DsnConfig {
         Ok(())
     }
 
-    pub fn is_allowed_ipv4(&self, addr: Ipv4Addr) -> bool {
-        let include = parse_ipv4_nets(&self.ip4_include_net).ok();
-        let exclude = parse_ipv4_nets(&self.ip4_exclude_net).ok();
-
-        match (include, exclude) {
-            (Some(include), Some(exclude)) => {
-                is_allowed_ipv4(addr, self.address_mode, &include, &exclude)
-            }
-            _ => false,
-        }
-    }
-
-    pub fn is_allowed_ipv6(&self, addr: Ipv6Addr) -> bool {
-        let include = parse_ipv6_nets(&self.ip6_include_net).ok();
-        let exclude = parse_ipv6_nets(&self.ip6_exclude_net).ok();
-
-        match (include, exclude) {
-            (Some(include), Some(exclude)) => {
-                is_allowed_ipv6(addr, self.address_mode, &include, &exclude)
-            }
-            _ => false,
-        }
-    }
-
-    fn validate_address_filters(&self) -> Result<()> {
-        parse_ipv4_nets(&self.ip4_include_net)?;
-        parse_ipv4_nets(&self.ip4_exclude_net)?;
-        parse_ipv6_nets(&self.ip6_include_net)?;
-        parse_ipv6_nets(&self.ip6_exclude_net)?;
-        Ok(())
-    }
-
     fn validate_transport_endpoints(&self) -> Result<()> {
         for (index, endpoint) in self.bootstrap_peers.iter().enumerate() {
             validate_transport_endpoint(endpoint)
