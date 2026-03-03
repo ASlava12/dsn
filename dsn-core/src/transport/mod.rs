@@ -1,3 +1,4 @@
+pub mod control;
 pub mod endpoint;
 pub mod frame;
 pub mod handshake;
@@ -5,6 +6,11 @@ pub mod mux;
 pub mod pow;
 pub mod runtime;
 pub mod session;
+
+pub use control::{
+    CONTROL_PROTOCOL_V1, ControlCodecError, ControlMessage, ControlMsgType, Delete, FindNode,
+    FindValue, NodeContact, Ping as ControlPing, Pong as ControlPong, Store,
+};
 
 pub use frame::{
     FRAME_V1_MAGIC, FRAME_V1_VERSION, FrameClass, FrameIoError, FrameLimits, FrameV1, read_frame,
