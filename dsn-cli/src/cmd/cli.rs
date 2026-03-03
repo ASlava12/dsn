@@ -15,6 +15,7 @@ pub struct Cli {
 pub enum Commands {
     Config(ConfigArgs),
     Transport(TransportArgs),
+    Node(NodeArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -27,6 +28,24 @@ pub struct TransportArgs {
 pub enum TransportCommands {
     Listen { transport: String },
     Connect { transport: String },
+}
+
+#[derive(Parser, Debug)]
+pub struct NodeArgs {
+    #[command(subcommand)]
+    pub command: NodeCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NodeCommands {
+    Up,
+    Down,
+    Status,
+    #[command(hide = true, name = "run")]
+    Run {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
 }
 
 #[derive(Parser, Debug)]
