@@ -13,8 +13,9 @@ pub use identity::generate_identity;
 
 pub use transport::{
     AsyncReadWrite, BoxedStreamConn, Connection, DatagramConn, FRAME_V1_MAGIC, FRAME_V1_VERSION,
-    FrameClass, FrameIoError, FrameLimits, FrameV1, G2Transport, H2Transport, QuicTransport,
-    TcpRawTransport, TlsTransport, Transport, TransportEndpoint, TransportParam, TransportScheme,
-    UdpRawTransport, UnixTransport, WsTransport, WssTransport, endpoint_socket_addr,
-    parse_bool_param, read_frame, reserved_transport_params, transport_for_scheme, write_frame,
+    FrameClass, FrameIoError, FrameLimits, FrameV1, G2Transport, H2Transport, MultiConn, MuxConfig,
+    MuxConn, MuxError, PeerLinks, PeerLinksMode, QuicTransport, TcpRawTransport, TlsTransport,
+    Transport, TransportEndpoint, TransportParam, TransportScheme, UdpRawTransport, UnixTransport,
+    WsTransport, WssTransport, endpoint_socket_addr, parse_bool_param, read_frame,
+    reserved_transport_params, transport_for_scheme, write_frame,
 };
