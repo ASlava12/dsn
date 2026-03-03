@@ -1,8 +1,8 @@
 use crate::config::AddressMode as ConfigAddressMode;
 use crate::transport::AddressMode as HsAddressMode;
 use crate::{
-    CONTROL_PROTOCOL_V1, ControlMessage, ControlPing, ControlPong, DhtRuntime, DsnConfig,
-    MuxConfig, PeerLinks, PeerLinksMode, SessionPolicy, SessionState, TransportEndpoint,
+    ControlMessage, ControlMsgType, ControlPing, ControlPong, DhtRuntime, DsnConfig, MuxConfig,
+    PeerLinks, PeerLinksMode, SessionPolicy, SessionState, TransportEndpoint,
     publish_public_identity, transport_for_scheme,
 };
 use anyhow::{Result, anyhow};
@@ -92,6 +92,7 @@ pub struct NodeRuntime {
     signing: SigningKey,
     verifying: VerifyingKey,
     node_id: [u8; 32],
+    peer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 pub struct NodeRuntimeHandle {
@@ -99,6 +100,7 @@ pub struct NodeRuntimeHandle {
     join_handles: Vec<JoinHandle<()>>,
     stats: Arc<Mutex<RuntimeStats>>,
     dht: Arc<Mutex<DhtRuntime>>,
+    peer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl NodeRuntime {
@@ -122,6 +124,7 @@ impl NodeRuntime {
             signing,
             verifying,
             node_id,
+            peer_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -158,6 +161,7 @@ impl NodeRuntime {
             join_handles,
             stats: shared.stats.clone(),
             dht: shared.dht.clone(),
+            peer_tasks: shared.peer_tasks.clone(),
         }
     }
 }
@@ -165,6 +169,9 @@ impl NodeRuntime {
 impl NodeRuntimeHandle {
     pub async fn stop(mut self) {
         let _ = self.shutdown_tx.send(true);
+        for t in self.peer_tasks.lock().await.drain(..) {
+            t.abort();
+        }
         for j in self.join_handles.drain(..) {
             let _ = j.await;
         }
@@ -193,7 +200,9 @@ async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Rece
                     accepted = accept_once(&rt, &endpoint) => {
                         if let Ok(peer) = accepted {
                             let key = format!("inbound-{}", now_us());
-                            rt.peers.write().await.insert(key, peer.clone());
+                            rt.peers.write().await.insert(key.clone(), peer.clone());
+                            let task = tokio::spawn(run_peer_read_loop(rt.clone(), peer, key));
+                            rt.peer_tasks.lock().await.push(task);
                             rt.stats.lock().await.active_sessions = rt.peers.read().await.len();
                         }
                     }
@@ -223,7 +232,7 @@ async fn accept_once(
             return Err(anyhow!("datagram listener unsupported in node mux"));
         }
     };
-    handshake_and_spawn(runtime.clone(), stream, false).await
+    handshake_and_build_peer(runtime.clone(), stream, false).await
 }
 
 async fn run_outbound_dial_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
@@ -248,8 +257,10 @@ async fn run_outbound_dial_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::
                         crate::Connection::Stream(s) => s,
                         crate::Connection::Datagram(_) => continue,
                     };
-                    if let Ok(peer) = handshake_and_spawn(runtime.clone(), stream, true).await {
-                        runtime.peers.write().await.insert(key, peer);
+                    if let Ok(peer) = handshake_and_build_peer(runtime.clone(), stream, true).await {
+                        runtime.peers.write().await.insert(key.clone(), peer.clone());
+                        let task = tokio::spawn(run_peer_read_loop(runtime.clone(), peer, key));
+                        runtime.peer_tasks.lock().await.push(task);
                         runtime.stats.lock().await.active_sessions = runtime.peers.read().await.len();
                     }
                 }
@@ -262,7 +273,7 @@ async fn run_outbound_dial_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::
     }
 }
 
-async fn handshake_and_spawn(
+async fn handshake_and_build_peer(
     runtime: Arc<NodeRuntime>,
     mut stream: crate::BoxedStreamConn,
     outbound: bool,
@@ -306,7 +317,7 @@ async fn handshake_and_spawn(
     let peer = Arc::new(PeerRuntime {
         links: links.clone(),
         session: Arc::new(Mutex::new(SessionState::new(
-            SessionPolicy::default(),
+            default_session_policy(),
             1,
             now_us(),
         ))),
@@ -314,11 +325,10 @@ async fn handshake_and_spawn(
         replay: Arc::new(Mutex::new(ReplayWindow::new())),
         send_seq: AtomicU64::new(1),
     });
-    tokio::spawn(run_peer_read_loop(runtime, peer.clone()));
     Ok(peer)
 }
 
-async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>) {
+async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, peer_key: String) {
     while let Ok(frame) = peer.links.recv().await {
         let aad = build_aad(frame.class as u8, frame.msg_type, frame.flags);
         let enc = match decode_encrypted_payload(&frame.payload) {
@@ -346,6 +356,9 @@ async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>) {
         }
         sess.on_bytes_sent(frame.payload.len());
     }
+
+    runtime.peers.write().await.remove(&peer_key);
+    runtime.stats.lock().await.active_sessions = runtime.peers.read().await.len();
 }
 
 async fn handle_control_message(
@@ -375,18 +388,15 @@ async fn handle_control_message(
 }
 
 async fn send_control(peer: Arc<PeerRuntime>, msg: ControlMessage) -> Result<()> {
+    let frame_msg_type = control_frame_msg_type(&msg);
     let payload = msg.encode();
     let seq = peer.send_seq.fetch_add(1, Ordering::Relaxed);
     let key_id = peer.session.lock().await.active_key_id();
-    let aad = build_aad(
-        crate::FrameClass::Control as u8,
-        CONTROL_PROTOCOL_V1 as u16,
-        0,
-    );
+    let aad = build_aad(crate::FrameClass::Control as u8, frame_msg_type, 0);
     let enc = crate::encrypt_frame(&peer.keys, key_id, seq, &payload, &aad)?;
     let framed_payload = encode_encrypted_payload(&enc);
     peer.links
-        .send_control(CONTROL_PROTOCOL_V1 as u16, 0, framed_payload)
+        .send_control(frame_msg_type, 0, framed_payload)
         .await
         .map_err(|e| anyhow!("send control failed: {e}"))?;
     peer.session.lock().await.on_bytes_sent(payload.len());
@@ -399,13 +409,31 @@ async fn run_ping_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let peers = runtime.peers.read().await.values().cloned().collect::<Vec<_>>();
-                for peer in peers {
+                let peers = runtime.peers.read().await.iter().map(|(k,v)| (k.clone(), v.clone())).collect::<Vec<_>>();
+                let mut timed_out_keys = Vec::new();
+                for (peer_key, peer) in peers {
                     let now = now_us();
-                    peer.session.lock().await.track_ping(request_id, now);
+                    {
+                        let mut session = peer.session.lock().await;
+                        if session.is_timed_out(now) {
+                            timed_out_keys.push(peer_key);
+                            continue;
+                        }
+                        session.track_ping(request_id, now);
+                    }
                     let ping = ControlMessage::Ping(ControlPing { request_id, sender_node_id: runtime.node_id });
-                    let _ = send_control(peer, ping).await;
+                    if send_control(peer, ping).await.is_err() {
+                        timed_out_keys.push(peer_key);
+                        continue;
+                    }
                     request_id = request_id.saturating_add(1);
+                }
+                if !timed_out_keys.is_empty() {
+                    let mut guard = runtime.peers.write().await;
+                    for key in timed_out_keys {
+                        guard.remove(&key);
+                    }
+                    runtime.stats.lock().await.active_sessions = guard.len();
                 }
                 runtime.stats.lock().await.last_tick_us = now_us();
             }
@@ -521,6 +549,18 @@ fn build_aad(class: u8, msg_type: u16, flags: u16) -> Vec<u8> {
     aad.extend_from_slice(&msg_type.to_be_bytes());
     aad.extend_from_slice(&flags.to_be_bytes());
     aad
+}
+
+fn control_frame_msg_type(msg: &ControlMessage) -> u16 {
+    match msg {
+        ControlMessage::Ping(_) => ControlMsgType::Ping as u16,
+        ControlMessage::Pong(_) => ControlMsgType::Pong as u16,
+        ControlMessage::FindNode(_) => ControlMsgType::FindNode as u16,
+        ControlMessage::FindValue(_) => ControlMsgType::FindValue as u16,
+        ControlMessage::Store(_) => ControlMsgType::Store as u16,
+        ControlMessage::Delete(_) => ControlMsgType::Delete as u16,
+        ControlMessage::NodeContact(_) => ControlMsgType::NodeContact as u16,
+    }
 }
 
 fn decode_signing_key(raw: &str) -> Result<SigningKey> {
@@ -672,6 +712,19 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+#[cfg(not(test))]
+fn default_session_policy() -> SessionPolicy {
+    SessionPolicy::default()
+}
+
+#[cfg(test)]
+fn default_session_policy() -> SessionPolicy {
+    SessionPolicy {
+        session_timeout_us: 6_000_000,
+        ..SessionPolicy::default()
+    }
 }
 
 #[cfg(test)]
