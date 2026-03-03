@@ -84,6 +84,12 @@ pub struct DsnConfig {
 
     #[serde(default)]
     pub node: NodeConfig,
+
+    #[serde(default)]
+    pub route_whitelist_node_ids: Vec<String>,
+
+    #[serde(default)]
+    pub route_blacklist_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +113,8 @@ impl DsnConfig {
             ip6_include_net: Vec::new(),
             ip6_exclude_net: Vec::new(),
             node: NodeConfig::default(),
+            route_whitelist_node_ids: Vec::new(),
+            route_blacklist_node_ids: Vec::new(),
         })
     }
 
@@ -151,6 +159,7 @@ impl DsnConfig {
         self.validate_transport_endpoints()?;
         self.validate_address_filters()?;
         self.validate_node_paths()?;
+        self.validate_route_acl()?;
 
         Ok(())
     }
@@ -193,6 +202,20 @@ impl DsnConfig {
         }
         if self.node.control_socket.trim().is_empty() {
             bail!("node.control_socket must not be empty");
+        }
+        Ok(())
+    }
+
+    fn validate_route_acl(&self) -> Result<()> {
+        for (label, entries) in [
+            ("route_whitelist_node_ids", &self.route_whitelist_node_ids),
+            ("route_blacklist_node_ids", &self.route_blacklist_node_ids),
+        ] {
+            for (idx, node_id) in entries.iter().enumerate() {
+                if node_id.len() != 64 || !node_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("{label}[{idx}] must be 64 hex characters");
+                }
+            }
         }
         Ok(())
     }

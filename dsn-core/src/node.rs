@@ -2,10 +2,10 @@ use crate::config::AddressMode as ConfigAddressMode;
 use crate::transport::AddressMode as HsAddressMode;
 use crate::{
     ControlMessage, ControlMsgType, ControlPing, ControlPong, ControlSessionChangeAck,
-    ControlSessionChangeRequest, DhtRuntime, DsnConfig, MuxConfig, PeerLinks, PeerLinksMode,
-    PowChallenge, PowScope, REKEY_ACK_OK, REKEY_ACK_REJECTED, RekeyReason, SessionPolicy,
-    SessionState, TokenBucket, TransportEndpoint, publish_public_identity, transport_for_scheme,
-    verify_pow,
+    ControlSessionChangeRequest, CreateRouteRequest, DhtRuntime, DsnConfig, MuxConfig, PeerLinks,
+    PeerLinksMode, PowChallenge, PowScope, REKEY_ACK_OK, REKEY_ACK_REJECTED, RekeyReason,
+    RouteManager, RouteStorageKind, SessionPolicy, SessionState, TokenBucket, TransportEndpoint,
+    publish_public_identity, transport_for_scheme, verify_pow,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine;
@@ -36,6 +36,11 @@ const NODE_CONTACT_FLAG_SOLUTION: u16 = 2;
 const NODE_CONTACT_FLAG_RESPONSE: u16 = 3;
 const NODE_CONTACT_CHALLENGE_TTL_US: u64 = 30_000_000;
 const NODE_CONTACT_DIFFICULTY: u8 = 18;
+const NET_MSG_CREATE_ROUTE_REQUEST: u16 = 0x0200;
+const NET_MSG_CREATE_ROUTE_RESPONSE: u16 = 0x0201;
+const NET_MSG_ROUTE_SEND_NODE: u16 = 0x0202;
+const DATA_MSG_ROUTE_SEND_IP4: u16 = 0x0300;
+const DATA_MSG_ROUTE_SEND_IP6: u16 = 0x0301;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeStats {
@@ -49,6 +54,8 @@ pub struct RuntimeStats {
     pub rekey_completed: u64,
     pub rekey_by_bytes: u64,
     pub rekey_by_age: u64,
+    pub route_forwarded: u64,
+    pub route_delivered: u64,
 }
 
 struct ReplayWindow {
@@ -161,6 +168,34 @@ struct NodeContactChallengeState {
     used: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RouteCreateWire {
+    session_id: [u8; 32],
+    src_node_id: [u8; 32],
+    dst_node_id: [u8; 32],
+    next_hop_node_id: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RouteCreateResponseWire {
+    session_id: [u8; 32],
+    status: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RouteSendNodeWire {
+    session_id: [u8; 32],
+    dst_node_id: [u8; 32],
+    payload: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RouteSendIpWire {
+    session_id: [u8; 32],
+    ip: String,
+    payload: Vec<u8>,
+}
+
 pub struct NodeRuntime {
     cfg: DsnConfig,
     dht: Arc<Mutex<DhtRuntime>>,
@@ -173,6 +208,7 @@ pub struct NodeRuntime {
     dht_requests: Arc<DhtRequestManager>,
     node_contact_challenges: Arc<Mutex<HashMap<[u8; 32], NodeContactChallengeState>>>,
     node_contact_bucket: Arc<Mutex<TokenBucket>>,
+    route_manager: Arc<Mutex<RouteManager>>,
 }
 
 pub struct NodeRuntimeHandle {
@@ -207,6 +243,8 @@ impl NodeRuntime {
                 rekey_completed: 0,
                 rekey_by_bytes: 0,
                 rekey_by_age: 0,
+                route_forwarded: 0,
+                route_delivered: 0,
             })),
             signing,
             verifying,
@@ -215,6 +253,7 @@ impl NodeRuntime {
             dht_requests: Arc::new(DhtRequestManager::new()),
             node_contact_challenges: Arc::new(Mutex::new(HashMap::new())),
             node_contact_bucket: Arc::new(Mutex::new(TokenBucket::new(32, 16, now))),
+            route_manager: Arc::new(Mutex::new(init_route_manager(&cfg))),
         }
     }
 
@@ -423,6 +462,52 @@ impl NodeRuntimeHandle {
         }
         Ok(response.payload)
     }
+
+    pub async fn create_route_via_first_peer(
+        &self,
+        session_id: [u8; 32],
+        dst_node_id: [u8; 32],
+        next_hop_node_id: [u8; 32],
+    ) -> Result<()> {
+        let peers = self.peers.read().await;
+        let Some(peer) = peers.values().next().cloned() else {
+            return Err(anyhow!("no active peers for route create"));
+        };
+        drop(peers);
+
+        let wire = RouteCreateWire {
+            session_id,
+            src_node_id: self.node_id,
+            dst_node_id,
+            next_hop_node_id,
+        };
+        send_net(
+            peer,
+            NET_MSG_CREATE_ROUTE_REQUEST,
+            serde_json::to_vec(&wire)?,
+        )
+        .await
+    }
+
+    pub async fn route_send_node_via_first_peer(
+        &self,
+        session_id: [u8; 32],
+        dst_node_id: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let peers = self.peers.read().await;
+        let Some(peer) = peers.values().next().cloned() else {
+            return Err(anyhow!("no active peers for route send"));
+        };
+        drop(peers);
+
+        let wire = RouteSendNodeWire {
+            session_id,
+            dst_node_id,
+            payload,
+        };
+        send_net(peer, NET_MSG_ROUTE_SEND_NODE, serde_json::to_vec(&wire)?).await
+    }
 }
 
 async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
@@ -604,6 +689,10 @@ async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, p
             && let Ok(msg) = ControlMessage::decode(&plain)
         {
             handle_control_message(runtime.clone(), peer.clone(), msg).await;
+        } else if frame.class == crate::FrameClass::Net {
+            handle_net_message(runtime.clone(), peer.clone(), frame.msg_type, &plain).await;
+        } else if frame.class == crate::FrameClass::Data {
+            handle_data_message(runtime.clone(), peer.clone(), frame.msg_type, &plain).await;
         }
     }
 
@@ -977,6 +1066,154 @@ async fn send_control(peer: Arc<PeerRuntime>, msg: ControlMessage) -> Result<()>
         .map_err(|e| anyhow!("send control failed: {e}"))?;
     peer.session.lock().await.on_bytes_sent(payload.len());
     Ok(())
+}
+
+async fn send_net(peer: Arc<PeerRuntime>, msg_type: u16, payload: Vec<u8>) -> Result<()> {
+    let seq = peer.send_seq.fetch_add(1, Ordering::Relaxed);
+    let key_id = peer.session.lock().await.active_key_id();
+    let aad = build_aad(crate::FrameClass::Net as u8, msg_type, 0);
+    let keys = { peer.keys.lock().await.clone() };
+    let enc = crate::encrypt_frame(&keys, key_id, seq, &payload, &aad)?;
+    let framed_payload = encode_encrypted_payload(&enc);
+    peer.links
+        .send_net(msg_type, 0, framed_payload)
+        .await
+        .map_err(|e| anyhow!("send net failed: {e}"))?;
+    peer.session.lock().await.on_bytes_sent(payload.len());
+    Ok(())
+}
+
+async fn send_data(peer: Arc<PeerRuntime>, msg_type: u16, payload: Vec<u8>) -> Result<()> {
+    let seq = peer.send_seq.fetch_add(1, Ordering::Relaxed);
+    let key_id = peer.session.lock().await.active_key_id();
+    let aad = build_aad(crate::FrameClass::Data as u8, msg_type, 0);
+    let keys = { peer.keys.lock().await.clone() };
+    let enc = crate::encrypt_frame(&keys, key_id, seq, &payload, &aad)?;
+    let framed_payload = encode_encrypted_payload(&enc);
+    let accepted = peer
+        .links
+        .send_data(msg_type, 0, framed_payload)
+        .await
+        .map_err(|e| anyhow!("send data failed: {e}"))?;
+    if !accepted {
+        return Err(anyhow!("data queue backpressure"));
+    }
+    peer.session.lock().await.on_bytes_sent(payload.len());
+    Ok(())
+}
+
+async fn handle_net_message(
+    runtime: Arc<NodeRuntime>,
+    peer: Arc<PeerRuntime>,
+    msg_type: u16,
+    payload: &[u8],
+) {
+    match msg_type {
+        NET_MSG_CREATE_ROUTE_REQUEST => {
+            let Ok(req) = serde_json::from_slice::<RouteCreateWire>(payload) else {
+                return;
+            };
+            let now = now_us();
+            let create_req = CreateRouteRequest {
+                session_id: req.session_id,
+                dst_node_id: req.dst_node_id,
+                src_node_id: req.src_node_id,
+                ingress_transport: format!("peer:{}", hex32(peer.peer_node_id)),
+                egress_transport: format!("peer:{}", hex32(req.next_hop_node_id)),
+                namespace: None,
+            };
+            let status = runtime
+                .route_manager
+                .lock()
+                .await
+                .create_route(create_req, now)
+                .map(|_| 0u8)
+                .unwrap_or(1u8);
+            let resp = RouteCreateResponseWire {
+                session_id: req.session_id,
+                status,
+            };
+            let _ = send_net(
+                peer,
+                NET_MSG_CREATE_ROUTE_RESPONSE,
+                serde_json::to_vec(&resp).unwrap_or_default(),
+            )
+            .await;
+        }
+        NET_MSG_CREATE_ROUTE_RESPONSE => {
+            let _ = serde_json::from_slice::<RouteCreateResponseWire>(payload);
+        }
+        NET_MSG_ROUTE_SEND_NODE => {
+            let Ok(msg) = serde_json::from_slice::<RouteSendNodeWire>(payload) else {
+                return;
+            };
+            if msg.dst_node_id == runtime.node_id {
+                let mut st = runtime.stats.lock().await;
+                st.route_delivered = st.route_delivered.saturating_add(1);
+                return;
+            }
+            let now = now_us();
+            let route = runtime
+                .route_manager
+                .lock()
+                .await
+                .use_route(msg.session_id, now)
+                .ok()
+                .flatten();
+            let Some(route) = route else {
+                return;
+            };
+            let next = parse_peer_node_id_from_transport(&route.egress_transport);
+            let Some(next_hop_id) = next else {
+                return;
+            };
+            let next_peer = find_peer_by_node_id(&runtime, next_hop_id).await;
+            let Some(next_peer) = next_peer else {
+                return;
+            };
+            let _ = send_net(next_peer, NET_MSG_ROUTE_SEND_NODE, payload.to_vec()).await;
+            let mut st = runtime.stats.lock().await;
+            st.route_forwarded = st.route_forwarded.saturating_add(1);
+        }
+        _ => {}
+    }
+}
+
+async fn handle_data_message(
+    runtime: Arc<NodeRuntime>,
+    _peer: Arc<PeerRuntime>,
+    msg_type: u16,
+    payload: &[u8],
+) {
+    match msg_type {
+        DATA_MSG_ROUTE_SEND_IP4 | DATA_MSG_ROUTE_SEND_IP6 => {
+            let Ok(msg) = serde_json::from_slice::<RouteSendIpWire>(payload) else {
+                return;
+            };
+            let now = now_us();
+            let route = runtime
+                .route_manager
+                .lock()
+                .await
+                .use_route(msg.session_id, now)
+                .ok()
+                .flatten();
+            let Some(route) = route else {
+                return;
+            };
+            let next = parse_peer_node_id_from_transport(&route.egress_transport);
+            let Some(next_hop_id) = next else {
+                return;
+            };
+            let Some(next_peer) = find_peer_by_node_id(&runtime, next_hop_id).await else {
+                return;
+            };
+            let _ = send_data(next_peer, msg_type, payload.to_vec()).await;
+            let mut st = runtime.stats.lock().await;
+            st.route_forwarded = st.route_forwarded.saturating_add(1);
+        }
+        _ => {}
+    }
 }
 
 async fn run_ping_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
@@ -1415,6 +1652,43 @@ fn endpoint_key(ep: &TransportEndpoint) -> String {
     )
 }
 
+fn hex32(id: [u8; 32]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+}
+
+fn parse_peer_node_id_from_transport(raw: &str) -> Option<[u8; 32]> {
+    let hex = raw.strip_prefix("peer:")?;
+    decode_hex_32(hex)
+}
+
+async fn find_peer_by_node_id(
+    runtime: &NodeRuntime,
+    node_id: [u8; 32],
+) -> Option<Arc<PeerRuntime>> {
+    runtime
+        .peers
+        .read()
+        .await
+        .values()
+        .find(|p| p.peer_node_id == node_id)
+        .cloned()
+}
+
+fn init_route_manager(cfg: &DsnConfig) -> RouteManager {
+    let mut manager = RouteManager::new(RouteStorageKind::Memory).expect("route manager memory");
+    for id in &cfg.route_whitelist_node_ids {
+        if let Some(parsed) = decode_hex_32(id) {
+            manager.acl_mut().whitelist_add(None, parsed);
+        }
+    }
+    for id in &cfg.route_blacklist_node_ids {
+        if let Some(parsed) = decode_hex_32(id) {
+            manager.acl_mut().blacklist_add(None, parsed);
+        }
+    }
+    manager
+}
+
 fn decode_hex_32(raw: &str) -> Option<[u8; 32]> {
     if raw.len() != 64 {
         return None;
@@ -1557,6 +1831,55 @@ mod tests {
 
         node_a.stop().await;
         node_b.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn route_send_node_goes_via_one_relay_and_updates_ttl_cache() -> Result<()> {
+        let mut cfg_a = DsnConfig::default_with_generated_identity()?;
+        let mut cfg_b = DsnConfig::default_with_generated_identity()?;
+        let mut cfg_c = DsnConfig::default_with_generated_identity()?;
+
+        cfg_a.listen = vec!["tcp://127.0.0.1:19481".parse()?];
+        cfg_b.listen = vec!["tcp://127.0.0.1:19482".parse()?];
+        cfg_c.listen = vec!["tcp://127.0.0.1:19483".parse()?];
+        cfg_a.bootstrap_peers = vec!["tcp://127.0.0.1:19482".parse()?];
+        cfg_b.bootstrap_peers = vec![
+            "tcp://127.0.0.1:19481".parse()?,
+            "tcp://127.0.0.1:19483".parse()?,
+        ];
+        cfg_c.bootstrap_peers = vec!["tcp://127.0.0.1:19482".parse()?];
+
+        let node_a = NodeRuntime::new(cfg_a).start();
+        let node_b = NodeRuntime::new(cfg_b).start();
+        let node_c = NodeRuntime::new(cfg_c).start();
+
+        sleep(Duration::from_secs(10)).await;
+
+        let c_id = {
+            let dht = node_c.dht();
+            dht.lock().await.node_id
+        };
+        let session_id = [0xAB; 32];
+        node_a
+            .create_route_via_first_peer(session_id, c_id, c_id)
+            .await?;
+
+        sleep(Duration::from_secs(1)).await;
+        node_a
+            .route_send_node_via_first_peer(session_id, c_id, b"hello-route".to_vec())
+            .await?;
+
+        sleep(Duration::from_secs(2)).await;
+
+        let stats_b = node_b.snapshot().await;
+        let stats_c = node_c.snapshot().await;
+        assert!(stats_b.route_forwarded >= 1, "relay must forward");
+        assert!(stats_c.route_delivered >= 1, "destination must receive");
+
+        node_a.stop().await;
+        node_b.stop().await;
+        node_c.stop().await;
         Ok(())
     }
 }
