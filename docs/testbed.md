@@ -83,3 +83,18 @@ leading_zero_bits(blake3(challenge_context || nonce)) >= difficulty
 - Anti-replay работает на `key_id + seq`.
 - PoW валидация детерминированна.
 - Address filtering pipeline выполняется в фиксированном порядке.
+
+
+## 5. In-process testbed (3–5 nodes)
+
+Для CI используется быстрый in-process сценарий (`dsn-core/tests/testbed_in_process.rs`) без реального сетевого развёртывания.
+
+Сценарии:
+
+- bootstrap + handshake
+- ping mesh
+- store/find
+- rekey (пониженный порог в тесте)
+- address publish
+
+Целевой SLA: стабильное выполнение < 30s на типичном CI runner.
