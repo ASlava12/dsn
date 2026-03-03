@@ -44,6 +44,22 @@ services:
       BOOTSTRAP_JSON='[\"ws://node1:8080/chat\",\"ws://node2:8080/chat\"]'
       /scripts/node-start.sh"
 
+
+  node:
+    image: rust:1.85
+    working_dir: /workspace
+    depends_on: [node1, node2, node3]
+    volumes:
+      - ../../:/workspace
+      - ./scripts:/scripts:ro
+    command: >
+      bash -lc "cargo build -p dsn-cli &&
+      CFG_PATH=/state/node.toml
+      STATE_DIR=/state/node-state
+      LISTEN_JSON='["ws://0.0.0.0:8080/chat","tcp://0.0.0.0:4101"]'
+      BOOTSTRAP_JSON='["ws://node1:8080/chat","ws://node2:8080/chat","ws://node3:8080/chat"]'
+      /scripts/node-start.sh"
+
   nginx:
     image: nginx:1.27
     depends_on: [node1]

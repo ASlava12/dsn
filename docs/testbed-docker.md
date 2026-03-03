@@ -92,3 +92,17 @@ curl -s -XDELETE localhost:8474/proxies/node1_data/toxics/cut
 ```bash
 docker compose down -v
 ```
+
+
+## Масштабирование до 20 нод
+
+Теперь в `docker-compose.yml` есть сервис `node`, поэтому можно поднимать 20 экземпляров одной командой:
+
+```bash
+cd testbed/docker
+docker compose up -d --scale node=20
+```
+
+- `node1..node3` остаются seed-нодами.
+- `node`-экземпляры автоматически используют bootstrap на `node1..node3`.
+- Пример статического конфига ноды: `testbed/docker/configs/node-dht-listen.toml`.
