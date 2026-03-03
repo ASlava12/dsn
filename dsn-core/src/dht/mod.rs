@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 const NON_RELAY_CACHE_TTL_US: u64 = 5 * 60 * 1_000_000;
+pub const PUBLICATION_TTL_US: u64 = 24 * 60 * 60 * 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhtRecord {
@@ -10,10 +11,16 @@ pub struct DhtRecord {
 }
 
 #[derive(Debug, Clone)]
+struct DhtValue {
+    value: Vec<u8>,
+    publication_date_us: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DhtRuntime {
     pub node_id: [u8; 32],
     pub participate_in_dht: bool,
-    stores: HashMap<String, HashMap<Vec<u8>, Vec<u8>>>,
+    stores: HashMap<String, HashMap<Vec<u8>, DhtValue>>,
     known_nodes: Vec<[u8; 32]>,
     non_relay_cache_until_us: HashMap<Vec<u8>, u64>,
 }
@@ -36,16 +43,49 @@ impl DhtRuntime {
     }
 
     pub fn store(&mut self, namespace: &str, key: Vec<u8>, value: Vec<u8>) {
-        self.stores
-            .entry(namespace.to_owned())
-            .or_default()
-            .insert(key, value);
+        self.store_with_publication_date(namespace, key, value, None);
+    }
+
+    pub fn store_publication(
+        &mut self,
+        namespace: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        publication_date_us: u64,
+    ) {
+        self.store_with_publication_date(namespace, key, value, Some(publication_date_us));
+    }
+
+    fn store_with_publication_date(
+        &mut self,
+        namespace: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        publication_date_us: Option<u64>,
+    ) {
+        self.stores.entry(namespace.to_owned()).or_default().insert(
+            key,
+            DhtValue {
+                value,
+                publication_date_us,
+            },
+        );
     }
 
     pub fn find_value(&self, namespace: &str, key: &[u8]) -> Option<Vec<u8>> {
         self.stores
             .get(namespace)
-            .and_then(|ns| ns.get(key).cloned())
+            .and_then(|ns| ns.get(key).map(|v| v.value.clone()))
+    }
+
+    pub fn find_value_at(&self, namespace: &str, key: &[u8], now_us: u64) -> Option<Vec<u8>> {
+        self.stores
+            .get(namespace)
+            .and_then(|ns| ns.get(key))
+            .and_then(|entry| match entry.publication_date_us {
+                Some(ts) if now_us > ts.saturating_add(PUBLICATION_TTL_US) => None,
+                _ => Some(entry.value.clone()),
+            })
     }
 
     pub fn delete(&mut self, namespace: &str, key: &[u8]) -> bool {
@@ -53,6 +93,15 @@ impl DhtRuntime {
             .get_mut(namespace)
             .and_then(|ns| ns.remove(key))
             .is_some()
+    }
+
+    pub fn expire_publications(&mut self, now_us: u64) {
+        for ns in self.stores.values_mut() {
+            ns.retain(|_, value| match value.publication_date_us {
+                Some(ts) => now_us <= ts.saturating_add(PUBLICATION_TTL_US),
+                None => true,
+            });
+        }
     }
 
     pub fn find_node(&self, target_id: [u8; 32], max: usize) -> Vec<[u8; 32]> {
@@ -92,7 +141,7 @@ fn xor_distance_prefix(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::DhtRuntime;
+    use super::{DhtRuntime, PUBLICATION_TTL_US};
 
     fn id(v: u8) -> [u8; 32] {
         [v; 32]
@@ -140,5 +189,23 @@ mod tests {
         assert!(dht.has_cached_request(&fingerprint, 1_000));
         assert!(dht.has_cached_request(&fingerprint, 1_000 + 4 * 60 * 1_000_000));
         assert!(!dht.has_cached_request(&fingerprint, 1_000 + 5 * 60 * 1_000_000 + 1));
+    }
+
+    #[test]
+    fn publication_ttl_expires_after_24h() {
+        let mut dht = DhtRuntime::new(id(1), true);
+        dht.store_publication("main", b"node-x".to_vec(), b"pubid".to_vec(), 10);
+
+        assert!(
+            dht.find_value_at("main", b"node-x", 10 + PUBLICATION_TTL_US)
+                .is_some()
+        );
+        assert!(
+            dht.find_value_at("main", b"node-x", 10 + PUBLICATION_TTL_US + 1)
+                .is_none()
+        );
+
+        dht.expire_publications(10 + PUBLICATION_TTL_US + 1);
+        assert!(dht.find_value("main", b"node-x").is_none());
     }
 }

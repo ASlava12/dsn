@@ -10,7 +10,11 @@ pub use config::{
     DsnConfig, IdentityConfig, fix_config, init_config, load_config, regenerate_keys, save_config,
     save_config_value, validate_config,
 };
-pub use identity::generate_identity;
+pub use identity::{
+    PublicIdentity, allocate_ipv4, allocate_ipv6, generate_identity, publish_public_identity,
+};
+
+pub use dht::{DhtRecord, DhtRuntime, PUBLICATION_TTL_US};
 
 pub use dht::{DhtRecord, DhtRuntime};
 
