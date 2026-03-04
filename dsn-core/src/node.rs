@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -41,6 +41,8 @@ const NET_MSG_CREATE_ROUTE_RESPONSE: u16 = 0x0201;
 const NET_MSG_ROUTE_SEND_NODE: u16 = 0x0202;
 const DATA_MSG_ROUTE_SEND_IP4: u16 = 0x0300;
 const DATA_MSG_ROUTE_SEND_IP6: u16 = 0x0301;
+const DHT_NAMESPACE_IP4: &str = "ip4";
+const DHT_NAMESPACE_IP6: &str = "ip6";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeStats {
@@ -196,6 +198,13 @@ struct RouteSendIpWire {
     payload: Vec<u8>,
 }
 
+struct TunRuntime {
+    ingress_tx: mpsc::Sender<Vec<u8>>,
+    ingress_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    egress_tx: mpsc::Sender<Vec<u8>>,
+    egress_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+}
+
 pub struct NodeRuntime {
     cfg: DsnConfig,
     dht: Arc<Mutex<DhtRuntime>>,
@@ -209,6 +218,7 @@ pub struct NodeRuntime {
     node_contact_challenges: Arc<Mutex<HashMap<[u8; 32], NodeContactChallengeState>>>,
     node_contact_bucket: Arc<Mutex<TokenBucket>>,
     route_manager: Arc<Mutex<RouteManager>>,
+    tun: Option<Arc<TunRuntime>>,
 }
 
 pub struct NodeRuntimeHandle {
@@ -220,6 +230,8 @@ pub struct NodeRuntimeHandle {
     peers: Arc<RwLock<HashMap<String, Arc<PeerRuntime>>>>,
     dht_requests: Arc<DhtRequestManager>,
     node_id: [u8; 32],
+    tun_ingress_tx: Option<mpsc::Sender<Vec<u8>>>,
+    tun_egress_rx: Option<Arc<Mutex<mpsc::Receiver<Vec<u8>>>>>,
 }
 
 impl NodeRuntime {
@@ -228,6 +240,18 @@ impl NodeRuntime {
         let signing = decode_signing_key(&cfg.identity.private_key).expect("valid private key");
         let verifying = signing.verifying_key();
         let now = now_us();
+        let tun = if cfg.tun_enabled {
+            let (ingress_tx, ingress_rx) = mpsc::channel(256);
+            let (egress_tx, egress_rx) = mpsc::channel(256);
+            Some(Arc::new(TunRuntime {
+                ingress_tx,
+                ingress_rx: Arc::new(Mutex::new(ingress_rx)),
+                egress_tx,
+                egress_rx: Arc::new(Mutex::new(egress_rx)),
+            }))
+        } else {
+            None
+        };
         Self {
             dht: Arc::new(Mutex::new(DhtRuntime::new(node_id, cfg.participate_in_dht))),
             cfg: cfg.clone(),
@@ -254,6 +278,7 @@ impl NodeRuntime {
             node_contact_challenges: Arc::new(Mutex::new(HashMap::new())),
             node_contact_bucket: Arc::new(Mutex::new(TokenBucket::new(32, 16, now))),
             route_manager: Arc::new(Mutex::new(init_route_manager(&cfg))),
+            tun,
         }
     }
 
@@ -282,8 +307,11 @@ impl NodeRuntime {
             shared.cfg.clone(),
             shared.dht.clone(),
             shared.stats.clone(),
-            shutdown_rx,
+            shutdown_rx.clone(),
         )));
+        if shared.cfg.tun_enabled {
+            join_handles.push(tokio::spawn(run_tun_loop(shared.clone(), shutdown_rx)));
+        }
 
         NodeRuntimeHandle {
             shutdown_tx,
@@ -294,6 +322,8 @@ impl NodeRuntime {
             peers: shared.peers.clone(),
             dht_requests: shared.dht_requests.clone(),
             node_id: shared.node_id,
+            tun_ingress_tx: shared.tun.as_ref().map(|t| t.ingress_tx.clone()),
+            tun_egress_rx: shared.tun.as_ref().map(|t| t.egress_rx.clone()),
         }
     }
 }
@@ -461,6 +491,26 @@ impl NodeRuntimeHandle {
             return Err(anyhow!("NODE_CONTACT denied or invalid response"));
         }
         Ok(response.payload)
+    }
+
+    pub async fn send_tun_packet(&self, packet: Vec<u8>) -> Result<()> {
+        let Some(tx) = &self.tun_ingress_tx else {
+            return Err(anyhow!("tun is not enabled"));
+        };
+        tx.send(packet)
+            .await
+            .map_err(|_| anyhow!("tun ingress closed"))
+    }
+
+    pub async fn recv_tun_packet(&self, timeout: Duration) -> Result<Vec<u8>> {
+        let Some(rx) = &self.tun_egress_rx else {
+            return Err(anyhow!("tun is not enabled"));
+        };
+        let mut guard = rx.lock().await;
+        let maybe = tokio::time::timeout(timeout, guard.recv())
+            .await
+            .map_err(|_| anyhow!("tun egress timeout"))?;
+        maybe.ok_or_else(|| anyhow!("tun egress closed"))
     }
 
     pub async fn create_route_via_first_peer(
@@ -1190,6 +1240,16 @@ async fn handle_data_message(
             let Ok(msg) = serde_json::from_slice::<RouteSendIpWire>(payload) else {
                 return;
             };
+
+            if is_local_tun_ip(&runtime.cfg, msg_type, &msg.ip) {
+                if let Some(tun) = &runtime.tun {
+                    let _ = tun.egress_tx.send(msg.payload).await;
+                    let mut st = runtime.stats.lock().await;
+                    st.route_delivered = st.route_delivered.saturating_add(1);
+                }
+                return;
+            }
+
             let now = now_us();
             let route = runtime
                 .route_manager
@@ -1213,6 +1273,54 @@ async fn handle_data_message(
             st.route_forwarded = st.route_forwarded.saturating_add(1);
         }
         _ => {}
+    }
+}
+
+async fn run_tun_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
+    let Some(tun) = runtime.tun.clone() else {
+        return;
+    };
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+            packet = async {
+                let mut rx = tun.ingress_rx.lock().await;
+                rx.recv().await
+            } => {
+                let Some(packet) = packet else { continue; };
+                let Some((msg_type, namespace, ip)) = parse_overlay_packet_destination(&packet) else {
+                    continue;
+                };
+                let now = now_us();
+                let target_node_id = {
+                    let dht = runtime.dht.lock().await;
+                    dht.find_value_at(namespace, ip.as_bytes(), now)
+                };
+                let Some(target_node_id) = target_node_id else {
+                    continue;
+                };
+                if target_node_id.len() != 32 {
+                    continue;
+                }
+                let mut dst = [0u8; 32];
+                dst.copy_from_slice(&target_node_id);
+                let Some(peer) = find_peer_by_node_id(&runtime, dst).await else {
+                    continue;
+                };
+                let msg = RouteSendIpWire {
+                    session_id: [0u8; 32],
+                    ip,
+                    payload: packet,
+                };
+                let Ok(bytes) = serde_json::to_vec(&msg) else {
+                    continue;
+                };
+                let _ = send_data(peer, msg_type, bytes).await;
+            }
+        }
     }
 }
 
@@ -1331,6 +1439,7 @@ async fn run_dht_publication_loop(
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     let mut ip4_nonce = 0u32;
     let mut ip6_nonce = 0u128;
+    let node_id = decode_hex_32(&cfg.identity.id).unwrap_or([0u8; 32]);
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -1338,6 +1447,14 @@ async fn run_dht_publication_loop(
                 let mut dht_guard = dht.lock().await;
                 dht_guard.expire_publications(now);
                 let _ = publish_public_identity(&cfg, &mut dht_guard, &cfg.identity, ip4_nonce, ip6_nonce, now);
+                if cfg.tun_enabled {
+                    if cfg.tun_use_ip4 && let Some(ip4) = &cfg.tun_ip4 {
+                        dht_guard.store_publication(DHT_NAMESPACE_IP4, ip4.as_bytes().to_vec(), node_id.to_vec(), now);
+                    }
+                    if cfg.tun_use_ip6 && let Some(ip6) = &cfg.tun_ip6 {
+                        dht_guard.store_publication(DHT_NAMESPACE_IP6, ip6.as_bytes().to_vec(), node_id.to_vec(), now);
+                    }
+                }
                 ip4_nonce = ip4_nonce.saturating_add(1);
                 ip6_nonce = ip6_nonce.saturating_add(1);
                 let mut st = stats.lock().await;
@@ -1656,6 +1773,36 @@ fn hex32(id: [u8; 32]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect::<String>()
 }
 
+fn parse_overlay_packet_destination(packet: &[u8]) -> Option<(u16, &'static str, String)> {
+    if packet.is_empty() {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    if version == 4 && packet.len() >= 20 {
+        let ip = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        return Some((DATA_MSG_ROUTE_SEND_IP4, DHT_NAMESPACE_IP4, ip.to_string()));
+    }
+    if version == 6 && packet.len() >= 40 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&packet[24..40]);
+        let ip = std::net::Ipv6Addr::from(octets);
+        return Some((DATA_MSG_ROUTE_SEND_IP6, DHT_NAMESPACE_IP6, ip.to_string()));
+    }
+    None
+}
+
+fn is_local_tun_ip(cfg: &DsnConfig, msg_type: u16, ip: &str) -> bool {
+    match msg_type {
+        DATA_MSG_ROUTE_SEND_IP4 => {
+            cfg.tun_enabled && cfg.tun_use_ip4 && cfg.tun_ip4.as_deref() == Some(ip)
+        }
+        DATA_MSG_ROUTE_SEND_IP6 => {
+            cfg.tun_enabled && cfg.tun_use_ip6 && cfg.tun_ip6.as_deref() == Some(ip)
+        }
+        _ => false,
+    }
+}
+
 fn parse_peer_node_id_from_transport(raw: &str) -> Option<[u8; 32]> {
     let hex = raw.strip_prefix("peer:")?;
     decode_hex_32(hex)
@@ -1880,6 +2027,63 @@ mod tests {
         node_a.stop().await;
         node_b.stop().await;
         node_c.stop().await;
+        Ok(())
+    }
+
+    fn ipv4_packet(dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 20 + payload.len()];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[20..].copy_from_slice(payload);
+        pkt
+    }
+
+    #[tokio::test]
+    async fn tun_mode_routes_packet_between_two_nodes_via_dht_ip4_map() -> Result<()> {
+        let mut cfg_a = DsnConfig::default_with_generated_identity()?;
+        let mut cfg_b = DsnConfig::default_with_generated_identity()?;
+
+        cfg_a.listen = vec!["tcp://127.0.0.1:19581".parse()?];
+        cfg_b.listen = vec!["tcp://127.0.0.1:19582".parse()?];
+        cfg_a.bootstrap_peers = vec!["tcp://127.0.0.1:19582".parse()?];
+        cfg_b.bootstrap_peers = vec!["tcp://127.0.0.1:19581".parse()?];
+
+        cfg_a.address_mode = crate::config::AddressMode::All;
+        cfg_b.address_mode = crate::config::AddressMode::All;
+        cfg_a.tun_enabled = true;
+        cfg_a.tun_use_ip4 = true;
+        cfg_a.tun_ip4 = Some("10.9.0.1".to_string());
+        cfg_b.tun_enabled = true;
+        cfg_b.tun_use_ip4 = true;
+        cfg_b.tun_ip4 = Some("10.9.0.2".to_string());
+
+        let node_a = NodeRuntime::new(cfg_a).start();
+        let node_b = NodeRuntime::new(cfg_b).start();
+
+        sleep(Duration::from_secs(8)).await;
+
+        {
+            let dht = node_a.dht();
+            dht.lock().await.store_publication(
+                super::DHT_NAMESPACE_IP4,
+                b"10.9.0.2".to_vec(),
+                node_b.node_id.to_vec(),
+                super::now_us(),
+            );
+        }
+
+        let packet = ipv4_packet([10, 9, 0, 2], b"tun-e2e");
+        node_a.send_tun_packet(packet.clone()).await?;
+
+        let got = node_b.recv_tun_packet(Duration::from_secs(5)).await?;
+        assert_eq!(got, packet);
+
+        node_a.stop().await;
+        node_b.stop().await;
         Ok(())
     }
 }
