@@ -1,5 +1,6 @@
 use crate::config::AddressMode as ConfigAddressMode;
 use crate::transport::AddressMode as HsAddressMode;
+use crate::transport::{SessionStore, SessionStoreKind};
 use crate::{
     ControlMessage, ControlMsgType, ControlPing, ControlPong, ControlSessionChangeAck,
     ControlSessionChangeRequest, CreateRouteRequest, DhtRuntime, DsnConfig, MuxConfig, PeerLinks,
@@ -43,6 +44,7 @@ const DATA_MSG_ROUTE_SEND_IP4: u16 = 0x0300;
 const DATA_MSG_ROUTE_SEND_IP6: u16 = 0x0301;
 const DHT_NAMESPACE_IP4: &str = "ip4";
 const DHT_NAMESPACE_IP6: &str = "ip6";
+const SESSION_STORE_FLUSH_INTERVAL_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeStats {
@@ -219,6 +221,7 @@ pub struct NodeRuntime {
     node_contact_bucket: Arc<Mutex<TokenBucket>>,
     route_manager: Arc<Mutex<RouteManager>>,
     tun: Option<Arc<TunRuntime>>,
+    session_store: Arc<dyn SessionStore>,
 }
 
 pub struct NodeRuntimeHandle {
@@ -240,6 +243,7 @@ impl NodeRuntime {
         let signing = decode_signing_key(&cfg.identity.private_key).expect("valid private key");
         let verifying = signing.verifying_key();
         let now = now_us();
+        let session_store = build_session_store(&cfg).expect("valid session store config");
         let tun = if cfg.tun_enabled {
             let (ingress_tx, ingress_rx) = mpsc::channel(256);
             let (egress_tx, egress_rx) = mpsc::channel(256);
@@ -279,6 +283,7 @@ impl NodeRuntime {
             node_contact_bucket: Arc::new(Mutex::new(TokenBucket::new(32, 16, now))),
             route_manager: Arc::new(Mutex::new(init_route_manager(&cfg))),
             tun,
+            session_store,
         }
     }
 
@@ -310,8 +315,15 @@ impl NodeRuntime {
             shutdown_rx.clone(),
         )));
         if shared.cfg.tun_enabled {
-            join_handles.push(tokio::spawn(run_tun_loop(shared.clone(), shutdown_rx)));
+            join_handles.push(tokio::spawn(run_tun_loop(
+                shared.clone(),
+                shutdown_rx.clone(),
+            )));
         }
+        join_handles.push(tokio::spawn(run_session_store_flush_loop(
+            shared.clone(),
+            shutdown_rx,
+        )));
 
         NodeRuntimeHandle {
             shutdown_tx,
@@ -694,13 +706,10 @@ async fn handshake_and_build_peer(
     }
 
     let links = Arc::new(PeerLinks::single_mux(stream, MuxConfig::default()));
+    let initial_session = restored_or_new_session_state(&runtime, peer_node_id, now_us());
     let peer = Arc::new(PeerRuntime {
         links: links.clone(),
-        session: Arc::new(Mutex::new(SessionState::new(
-            default_session_policy(),
-            1,
-            now_us(),
-        ))),
+        session: Arc::new(Mutex::new(initial_session)),
         keys: Arc::new(Mutex::new(keys)),
         replay: Arc::new(Mutex::new(ReplayWindow::new())),
         send_seq: AtomicU64::new(1),
@@ -747,6 +756,7 @@ async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, p
     }
 
     runtime.peers.write().await.remove(&peer_key);
+    let _ = runtime.session_store.delete(peer.peer_node_id);
     runtime.stats.lock().await.active_sessions = runtime.peers.read().await.len();
 }
 
@@ -1324,6 +1334,45 @@ async fn run_tun_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<b
     }
 }
 
+async fn run_session_store_flush_loop(
+    runtime: Arc<NodeRuntime>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(SESSION_STORE_FLUSH_INTERVAL_SECS));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                flush_sessions_to_store(runtime.clone()).await;
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    flush_sessions_to_store(runtime.clone()).await;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn flush_sessions_to_store(runtime: Arc<NodeRuntime>) {
+    let peers = runtime
+        .peers
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for peer in peers {
+        let snapshot = {
+            let sess = peer.session.lock().await;
+            sess.snapshot(peer.peer_node_id)
+        };
+        let _ = runtime.session_store.save(&snapshot);
+    }
+}
+
 async fn run_ping_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     let mut request_id: u64 = 1;
@@ -1352,7 +1401,9 @@ async fn run_ping_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<
                 if !timed_out_keys.is_empty() {
                     let mut guard = runtime.peers.write().await;
                     for key in timed_out_keys {
-                        guard.remove(&key);
+                        if let Some(peer) = guard.remove(&key) {
+                            let _ = runtime.session_store.delete(peer.peer_node_id);
+                        }
                     }
                     runtime.stats.lock().await.active_sessions = guard.len();
                 }
@@ -1468,6 +1519,41 @@ async fn run_dht_publication_loop(
                 if *shutdown.borrow() { break; }
             }
         }
+    }
+}
+
+fn build_session_store(cfg: &DsnConfig) -> Result<Arc<dyn SessionStore>> {
+    let kind = match cfg.node.session_store.as_str() {
+        "memory" => SessionStoreKind::Memory,
+        "file" => {
+            let dir = std::path::Path::new(&cfg.node.state_dir).join(&cfg.node.session_store_path);
+            SessionStoreKind::File { dir }
+        }
+        "redis" => {
+            SessionStoreKind::Redis {
+                uri: cfg.node.session_store_redis_url.clone().ok_or_else(|| {
+                    anyhow!("missing node.session_store_redis_url for store=redis")
+                })?,
+                prefix: cfg.node.session_store_redis_prefix.clone(),
+            }
+        }
+        other => return Err(anyhow!("unsupported session_store kind: {other}")),
+    };
+
+    Ok(Arc::from(kind.build()?))
+}
+
+fn restored_or_new_session_state(
+    runtime: &NodeRuntime,
+    peer_node_id: [u8; 32],
+    now_us: u64,
+) -> SessionState {
+    let persisted = runtime.session_store.load(peer_node_id).ok().flatten();
+    match persisted {
+        Some(p) if p.version == 1 => {
+            SessionState::from_persisted(default_session_policy(), p, now_us)
+        }
+        _ => SessionState::new(default_session_policy(), 1, now_us),
     }
 }
 
@@ -2027,6 +2113,68 @@ mod tests {
         node_a.stop().await;
         node_b.stop().await;
         node_c.stop().await;
+        Ok(())
+    }
+
+    #[test]
+    fn file_session_store_restores_session_state_into_runtime() -> Result<()> {
+        let mut cfg = DsnConfig::default_with_generated_identity()?;
+        cfg.node.session_store = "file".to_string();
+        cfg.node.state_dir = std::env::temp_dir()
+            .join(format!("dsn-node-store-{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        cfg.node.session_store_path = "sessions-runtime".to_string();
+
+        let peer_id = [0xAA; 32];
+        {
+            let rt = NodeRuntime::new(cfg.clone());
+            rt.session_store
+                .save(&crate::transport::PersistedPeerSession {
+                    version: 1,
+                    peer_node_id: peer_id,
+                    active_key_id: 77,
+                    bytes_on_active_key: 1234,
+                    active_key_since_us: 111,
+                    last_pong_us: 222,
+                })?;
+        }
+
+        let rt2 = NodeRuntime::new(cfg.clone());
+        let restored = super::restored_or_new_session_state(&rt2, peer_id, 333);
+        assert_eq!(restored.active_key_id(), 77);
+
+        let path = std::path::Path::new(&cfg.node.state_dir);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn redis_session_store_restores_session_state_when_redis_available() -> Result<()> {
+        let Some(redis_url) = std::env::var("DSN_TEST_REDIS_URL").ok() else {
+            return Ok(());
+        };
+
+        let mut cfg = DsnConfig::default_with_generated_identity()?;
+        cfg.node.session_store = "redis".to_string();
+        cfg.node.session_store_redis_url = Some(redis_url);
+        cfg.node.session_store_redis_prefix = format!("dsn:test:{}", std::process::id());
+
+        let peer_id = [0xBB; 32];
+        let rt = NodeRuntime::new(cfg.clone());
+        rt.session_store
+            .save(&crate::transport::PersistedPeerSession {
+                version: 1,
+                peer_node_id: peer_id,
+                active_key_id: 55,
+                bytes_on_active_key: 5,
+                active_key_since_us: 10,
+                last_pong_us: 20,
+            })?;
+
+        let rt2 = NodeRuntime::new(cfg);
+        let restored = super::restored_or_new_session_state(&rt2, peer_id, 40);
+        assert_eq!(restored.active_key_id(), 55);
         Ok(())
     }
 

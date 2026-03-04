@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+use crate::transport::PersistedPeerSession;
+
 pub const REKEY_BYTES_THRESHOLD_V1: u64 = 64 * 1024 * 1024 * 1024;
 pub const REKEY_AGE_THRESHOLD_US_V1: u64 = 24 * 60 * 60 * 1_000_000;
 
@@ -95,6 +97,35 @@ impl SessionState {
 
     pub fn active_key_id(&self) -> u32 {
         self.active_key_id
+    }
+
+    pub fn from_persisted(
+        policy: SessionPolicy,
+        persisted: PersistedPeerSession,
+        now_us: u64,
+    ) -> Self {
+        Self {
+            policy,
+            active_key_id: persisted.active_key_id,
+            active_key_since_us: persisted.active_key_since_us,
+            bytes_on_active_key: persisted.bytes_on_active_key,
+            pending_rekey: None,
+            previous_key_grace: None,
+            last_pong_us: persisted.last_pong_us.min(now_us),
+            pending_pings: HashMap::new(),
+            rtt_ring_us: VecDeque::with_capacity(5),
+        }
+    }
+
+    pub fn snapshot(&self, peer_node_id: [u8; 32]) -> PersistedPeerSession {
+        PersistedPeerSession {
+            version: 1,
+            peer_node_id,
+            active_key_id: self.active_key_id,
+            bytes_on_active_key: self.bytes_on_active_key,
+            active_key_since_us: self.active_key_since_us,
+            last_pong_us: self.last_pong_us,
+        }
     }
 
     pub fn should_rekey(&self, now_us: u64) -> bool {
@@ -312,5 +343,16 @@ mod tests {
             .handle_pong(pong, 1_102)
             .expect("pong should recover liveness");
         assert!(!state.is_timed_out(1_150));
+    }
+
+    #[test]
+    fn persisted_snapshot_restores_state() {
+        let mut state = SessionState::new(SessionPolicy::default(), 3, 10);
+        state.on_bytes_sent(77);
+
+        let snap = state.snapshot([9u8; 32]);
+        assert_eq!(snap.version, 1);
+        let restored = SessionState::from_persisted(SessionPolicy::default(), snap, 40);
+        assert_eq!(restored.active_key_id(), 3);
     }
 }

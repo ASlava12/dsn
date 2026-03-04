@@ -10,11 +10,17 @@ use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedPeerSession {
+    #[serde(default = "persisted_version_v1")]
+    pub version: u16,
     pub peer_node_id: [u8; 32],
     pub active_key_id: u32,
     pub bytes_on_active_key: u64,
     pub active_key_since_us: u64,
     pub last_pong_us: u64,
+}
+
+fn persisted_version_v1() -> u16 {
+    1
 }
 
 pub trait SessionStore: Send + Sync {
@@ -235,7 +241,12 @@ pub fn validate_redis_session_store_uri(uri: &str) -> Result<()> {
         if parsed.scheme() != "redis+unix" {
             bail!("unsupported redis URI scheme");
         }
-        if parsed.path().is_empty() || parsed.path() == "/" {
+
+        let socket_from_path = parsed.path();
+        let socket_from_host = parsed.host_str().unwrap_or_default();
+        let has_socket = (socket_from_path != "/" && !socket_from_path.is_empty())
+            || (!socket_from_host.is_empty() && socket_from_host != "%2F");
+        if !has_socket {
             bail!("redis+unix URI must include socket path");
         }
         return Ok(());
@@ -270,6 +281,7 @@ mod tests {
 
     fn sample(peer: [u8; 32]) -> PersistedPeerSession {
         PersistedPeerSession {
+            version: 1,
             peer_node_id: peer,
             active_key_id: 7,
             bytes_on_active_key: 42,
@@ -327,6 +339,7 @@ mod tests {
             "redis://user:pass@localhost:6379/0",
             "rediss://localhost:6380/1?tls=true",
             "redis+unix:///var/run/redis.sock",
+            "redis+unix://%2Fvar%2Frun%2Fredis.sock",
         ];
 
         for uri in ok {

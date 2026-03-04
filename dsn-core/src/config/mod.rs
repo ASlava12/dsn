@@ -36,6 +36,14 @@ pub struct NodeConfig {
     pub state_dir: String,
     #[serde(default = "default_control_socket")]
     pub control_socket: String,
+    #[serde(default = "default_session_store")]
+    pub session_store: String,
+    #[serde(default = "default_session_store_path")]
+    pub session_store_path: String,
+    #[serde(default)]
+    pub session_store_redis_url: Option<String>,
+    #[serde(default = "default_session_store_redis_prefix")]
+    pub session_store_redis_prefix: String,
 }
 
 fn default_state_dir() -> String {
@@ -46,11 +54,27 @@ fn default_control_socket() -> String {
     "control.sock".to_string()
 }
 
+fn default_session_store() -> String {
+    "memory".to_string()
+}
+
+fn default_session_store_path() -> String {
+    "sessions".to_string()
+}
+
+fn default_session_store_redis_prefix() -> String {
+    "dsn:sessions:v1".to_string()
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             state_dir: default_state_dir(),
             control_socket: default_control_socket(),
+            session_store: default_session_store(),
+            session_store_path: default_session_store_path(),
+            session_store_redis_url: None,
+            session_store_redis_prefix: default_session_store_redis_prefix(),
         }
     }
 }
@@ -223,6 +247,28 @@ impl DsnConfig {
         }
         if self.node.control_socket.trim().is_empty() {
             bail!("node.control_socket must not be empty");
+        }
+        match self.node.session_store.as_str() {
+            "memory" => {}
+            "file" => {
+                if self.node.session_store_path.trim().is_empty() {
+                    bail!("node.session_store_path must not be empty for store=file");
+                }
+            }
+            "redis" => {
+                let url = self
+                    .node
+                    .session_store_redis_url
+                    .as_deref()
+                    .ok_or_else(|| {
+                        anyhow!("node.session_store_redis_url is required for store=redis")
+                    })?;
+                crate::transport::validate_redis_session_store_uri(url)?;
+                if self.node.session_store_redis_prefix.trim().is_empty() {
+                    bail!("node.session_store_redis_prefix must not be empty for store=redis");
+                }
+            }
+            other => bail!("node.session_store must be one of: memory|file|redis, got '{other}'"),
         }
         Ok(())
     }
@@ -891,6 +937,30 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("tun_ip4 '10.10.10.2' is not allowed")
+        );
+    }
+
+    #[test]
+    fn validate_accepts_supported_session_store_variants() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.node.session_store = "file".to_string();
+        cfg.node.session_store_path = "sessions-dir".to_string();
+        cfg.validate().expect("file session store should validate");
+
+        cfg.node.session_store = "redis".to_string();
+        cfg.node.session_store_redis_url = Some("redis://localhost/0".to_string());
+        cfg.validate().expect("redis session store should validate");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_session_store_variant() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.node.session_store = "sqlite".to_string();
+
+        let err = cfg.validate().expect_err("unknown store must fail");
+        assert!(
+            err.to_string()
+                .contains("node.session_store must be one of")
         );
     }
 
