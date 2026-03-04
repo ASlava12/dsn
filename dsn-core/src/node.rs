@@ -355,6 +355,10 @@ impl NodeRuntimeHandle {
         self.stats.lock().await.clone()
     }
 
+    pub fn stats_arc(&self) -> Arc<Mutex<RuntimeStats>> {
+        self.stats.clone()
+    }
+
     pub fn dht(&self) -> Arc<Mutex<DhtRuntime>> {
         self.dht.clone()
     }

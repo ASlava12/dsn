@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use dsn_core::{DsnConfig, NodeRuntime, RuntimeStats, load_config, resolve_config_path};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::fs;
@@ -9,12 +9,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
-use crate::cmd::cli::NodeCommands;
+use crate::cmd::cli::{NodeAclCommands, NodeCommands};
 
 #[derive(Debug, Default)]
 struct DhtCliState {
     ip4_enabled: bool,
     ip6_enabled: bool,
+    whitelist: HashSet<String>,
+    blacklist: HashSet<String>,
 }
 
 pub async fn handle(command: NodeCommands, explicit_config: Option<PathBuf>) -> Result<()> {
@@ -23,6 +25,12 @@ pub async fn handle(command: NodeCommands, explicit_config: Option<PathBuf>) -> 
         NodeCommands::Down { state_dir } => down(explicit_config, state_dir).await,
         NodeCommands::Status { state_dir } => status(explicit_config, state_dir).await,
         NodeCommands::Run { state_dir } => run_foreground(explicit_config, state_dir).await,
+        NodeCommands::Whitelist { state_dir, command } => {
+            update_acl(explicit_config, state_dir, "whitelist", command).await
+        }
+        NodeCommands::Blacklist { state_dir, command } => {
+            update_acl(explicit_config, state_dir, "blacklist", command).await
+        }
     }
 }
 
@@ -57,12 +65,23 @@ async fn up(explicit_config: Option<PathBuf>, state_dir: Option<PathBuf>) -> Res
         .stderr(Stdio::null());
 
     let child = cmd.spawn().context("failed to spawn node runtime")?;
+    let cfg = load_runtime_config(explicit_config.as_deref())?;
+    let socket = control_socket_path(&cfg, &state_dir);
     println!("node started (pid={})", child.id());
+    println!("admin socket={}", socket.display());
     Ok(())
 }
 
 async fn down(explicit_config: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
     let state_dir = state_dir_for(explicit_config.as_deref(), state_dir.as_deref())?;
+    let cfg = load_runtime_config(explicit_config.as_deref())?;
+    let sock = control_socket_path(&cfg, &state_dir);
+
+    if query_admin_socket(&sock, "shutdown").await.is_ok() {
+        println!("node stopping via admin socket");
+        return Ok(());
+    }
+
     let pid_path = state_dir.join("node.pid");
     let Some(pid) = read_pid(&pid_path).await? else {
         println!("node is not running");
@@ -91,25 +110,68 @@ async fn down(explicit_config: Option<PathBuf>, state_dir: Option<PathBuf>) -> R
 
 async fn status(explicit_config: Option<PathBuf>, state_dir: Option<PathBuf>) -> Result<()> {
     let state_dir = state_dir_for(explicit_config.as_deref(), state_dir.as_deref())?;
-    let pid_path = state_dir.join("node.pid");
-    let stats_path = state_dir.join("status.json");
+    let cfg = load_runtime_config(explicit_config.as_deref())?;
+    let sock = control_socket_path(&cfg, &state_dir);
 
-    let Some(pid) = read_pid(&pid_path).await? else {
-        println!("down");
-        return Ok(());
+    let response = match query_admin_socket(&sock, "status").await {
+        Ok(v) => v,
+        Err(_) => {
+            println!("down");
+            return Ok(());
+        }
     };
 
-    if !process_alive(pid).await {
-        println!("down");
+    if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
+        println!("down ({err})");
         return Ok(());
     }
 
-    let details = read_status(&stats_path).await.unwrap_or_default();
-    println!(
-        "up pid={} sessions={} published={} last_tick_us={}",
-        pid, details.active_sessions, details.published_identities, details.last_tick_us
-    );
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+async fn update_acl(
+    explicit_config: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    which: &str,
+    command: NodeAclCommands,
+) -> Result<()> {
+    let state_dir = state_dir_for(explicit_config.as_deref(), state_dir.as_deref())?;
+    let cfg = load_runtime_config(explicit_config.as_deref())?;
+    let sock = control_socket_path(&cfg, &state_dir);
+    let request = match command {
+        NodeAclCommands::List => format!("{which} list"),
+        NodeAclCommands::Add { node_id } => format!("{which} add {node_id}"),
+        NodeAclCommands::Del { node_id } => format!("{which} del {node_id}"),
+    };
+
+    let response = query_admin_socket(&sock, &request).await?;
+    if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
+        bail!(err.to_string());
+    }
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+async fn query_admin_socket(sock: &Path, request: &str) -> Result<serde_json::Value> {
+    let mut stream = tokio::net::UnixStream::connect(sock)
+        .await
+        .with_context(|| format!("failed to connect admin socket {}", sock.display()))?;
+    stream.write_all(request.as_bytes()).await?;
+    stream
+        .write_all(
+            b"
+",
+        )
+        .await?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut line).await?;
+    if line.trim().is_empty() {
+        bail!("empty response from admin socket");
+    }
+    Ok(serde_json::from_str(line.trim())?)
 }
 
 async fn run_foreground(
@@ -125,6 +187,7 @@ async fn run_foreground(
     })?;
     let pid_path = state_dir.join("node.pid");
     let stats_path = state_dir.join("status.json");
+    let runtime_state_path = state_dir.join("runtime.json");
 
     let cfg = load_runtime_config(explicit_config.as_deref())?;
     let control_sock_path = control_socket_path(&cfg, &state_dir);
@@ -137,15 +200,24 @@ async fn run_foreground(
     if std::fs::metadata(&control_sock_path).is_ok() {
         let _ = std::fs::remove_file(&control_sock_path);
     }
+    let (admin_shutdown_tx, mut admin_shutdown_rx) = tokio::sync::watch::channel(false);
     let control_task = tokio::spawn(run_control_socket_server(
         control_sock_path.clone(),
         dht,
         cfg.identity.id.clone(),
         cli_state,
         name_registry_path,
+        admin_shutdown_tx,
+        handle.stats_arc(),
+        std::process::id(),
     ));
 
     fs::write(&pid_path, std::process::id().to_string()).await?;
+    let runtime_state = RuntimeStateFile {
+        pid: std::process::id(),
+        socket_path: control_sock_path.to_string_lossy().to_string(),
+    };
+    fs::write(&runtime_state_path, serde_json::to_vec(&runtime_state)?).await?;
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     let shutdown = shutdown_signal();
@@ -161,6 +233,11 @@ async fn run_foreground(
             _ = &mut shutdown => {
                 break;
             }
+            _ = admin_shutdown_rx.changed() => {
+                if *admin_shutdown_rx.borrow() {
+                    break;
+                }
+            }
         }
     }
 
@@ -168,6 +245,7 @@ async fn run_foreground(
     handle.stop().await;
     let _ = fs::remove_file(&pid_path).await;
     let _ = fs::remove_file(&control_sock_path).await;
+    let _ = fs::remove_file(&runtime_state_path).await;
     Ok(())
 }
 
@@ -241,6 +319,12 @@ async fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeStateFile {
+    pid: u32,
+    socket_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedStatus {
     active_sessions: usize,
@@ -256,11 +340,6 @@ impl PersistedStatus {
             last_tick_us: stats.last_tick_us,
         }
     }
-}
-
-async fn read_status(path: &Path) -> Result<PersistedStatus> {
-    let raw = fs::read(path).await?;
-    Ok(serde_json::from_slice(&raw)?)
 }
 
 async fn load_name_registry(path: &Path) -> Result<HashMap<String, String>> {
@@ -284,12 +363,33 @@ async fn save_name_registry(path: &Path, names: &HashMap<String, String>) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::{DhtCliState, handle_dht_admin_request, state_dir_for};
+    use super::{DhtCliState, handle_admin_request, state_dir_for};
     use anyhow::Result;
     use dsn_core::DhtRuntime;
+    use dsn_core::RuntimeStats;
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    async fn call_admin(
+        request: &str,
+        dht: Arc<Mutex<DhtRuntime>>,
+        cli_state: Arc<Mutex<DhtCliState>>,
+        registry_path: &Path,
+    ) -> serde_json::Value {
+        let (tx, _) = tokio::sync::watch::channel(false);
+        handle_admin_request(
+            request,
+            dht,
+            "node-a",
+            cli_state,
+            registry_path,
+            tx,
+            Arc::new(Mutex::new(RuntimeStats::default())),
+            1,
+        )
+        .await
+    }
 
     #[test]
     fn state_dir_is_adjacent_to_config() -> Result<()> {
@@ -312,30 +412,27 @@ mod tests {
         let dht = Arc::new(Mutex::new(DhtRuntime::new([1; 32], true)));
         let cli_state = Arc::new(Mutex::new(DhtCliState::default()));
 
-        let take = handle_dht_admin_request(
+        let take = call_admin(
             "name take test",
             dht.clone(),
-            "node-a",
             cli_state.clone(),
             &registry_path,
         )
         .await;
         assert_eq!(take.get("ok").and_then(|v| v.as_bool()), Some(true));
 
-        let get = handle_dht_admin_request(
+        let get = call_admin(
             "name get test",
             dht.clone(),
-            "node-a",
             cli_state.clone(),
             &registry_path,
         )
         .await;
         assert_eq!(get.get("owner").and_then(|v| v.as_str()), Some("node-a"));
 
-        let check = handle_dht_admin_request(
+        let check = call_admin(
             "name check test",
             dht.clone(),
-            "node-a",
             cli_state.clone(),
             &registry_path,
         )
@@ -349,6 +446,43 @@ mod tests {
         assert_eq!(
             dht_guard.find_value("name", b"test").as_deref(),
             Some(b"node-a".as_slice())
+        );
+
+        let _ = tokio::fs::remove_file(&registry_path).await;
+    }
+
+    #[tokio::test]
+    async fn admin_status_and_acl_commands_work() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "dsn-admin-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let dht = Arc::new(Mutex::new(DhtRuntime::new([2; 32], true)));
+        let cli_state = Arc::new(Mutex::new(DhtCliState::default()));
+
+        let status = call_admin("status", dht.clone(), cli_state.clone(), &registry_path).await;
+        assert_eq!(status.get("pid").and_then(|v| v.as_u64()), Some(1));
+
+        let add = call_admin(
+            "whitelist add 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            dht.clone(),
+            cli_state.clone(),
+            &registry_path,
+        )
+        .await;
+        assert_eq!(add.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let list = call_admin("whitelist list", dht, cli_state, &registry_path).await;
+        assert_eq!(
+            list.get("whitelist")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
         );
 
         let _ = tokio::fs::remove_file(&registry_path).await;
@@ -377,9 +511,7 @@ mod tests {
         let dht = Arc::new(Mutex::new(DhtRuntime::new([1; 32], true)));
         let cli_state = Arc::new(Mutex::new(DhtCliState::default()));
 
-        let get =
-            handle_dht_admin_request("name get shared", dht, "node-a", cli_state, &registry_path)
-                .await;
+        let get = call_admin("name get shared", dht, cli_state, &registry_path).await;
 
         assert_eq!(get.get("owner").and_then(|v| v.as_str()), Some("node-z"));
 
@@ -393,6 +525,9 @@ async fn run_control_socket_server(
     my_id: String,
     cli_state: std::sync::Arc<Mutex<DhtCliState>>,
     registry_path: PathBuf,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    stats: std::sync::Arc<Mutex<RuntimeStats>>,
+    pid: u32,
 ) -> Result<()> {
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("failed to bind control socket {}", sock_path.display()))?;
@@ -403,6 +538,8 @@ async fn run_control_socket_server(
         let my_id = my_id.clone();
         let cli_state = cli_state.clone();
         let registry_path = registry_path.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
@@ -410,8 +547,17 @@ async fn run_control_socket_server(
             let response = match reader.read_line(&mut line).await {
                 Ok(0) => serde_json::json!({"error":"empty request"}),
                 Ok(_) => {
-                    handle_dht_admin_request(line.trim(), dht, &my_id, cli_state, &registry_path)
-                        .await
+                    handle_admin_request(
+                        line.trim(),
+                        dht,
+                        &my_id,
+                        cli_state,
+                        &registry_path,
+                        shutdown_tx,
+                        stats,
+                        pid,
+                    )
+                    .await
                 }
                 Err(e) => serde_json::json!({"error": format!("io error: {e}")}),
             };
@@ -422,12 +568,15 @@ async fn run_control_socket_server(
     }
 }
 
-async fn handle_dht_admin_request(
+async fn handle_admin_request(
     request: &str,
     dht: std::sync::Arc<Mutex<dsn_core::DhtRuntime>>,
     my_id: &str,
     cli_state: std::sync::Arc<Mutex<DhtCliState>>,
     registry_path: &Path,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    stats: std::sync::Arc<Mutex<RuntimeStats>>,
+    pid: u32,
 ) -> serde_json::Value {
     let parts: Vec<&str> = request.split_whitespace().collect();
     if parts.is_empty() {
@@ -435,6 +584,21 @@ async fn handle_dht_admin_request(
     }
 
     match parts.as_slice() {
+        ["status"] => {
+            let snapshot = stats.lock().await.clone();
+            serde_json::json!({
+                "pid": pid,
+                "active_sessions": snapshot.active_sessions,
+                "published_identities": snapshot.published_identities,
+                "last_tick_us": snapshot.last_tick_us,
+                "listen_endpoints": snapshot.listen_endpoints,
+                "bootstrap_peers": snapshot.bootstrap_peers
+            })
+        }
+        ["shutdown"] => {
+            let _ = shutdown_tx.send(true);
+            serde_json::json!({"ok": true})
+        }
         ["namespaces"] => {
             let guard = dht.lock().await;
             serde_json::json!({"namespaces": guard.namespaces()})
@@ -548,6 +712,59 @@ async fn handle_dht_admin_request(
                     break serde_json::json!({"error":"challenge limit exceeded"});
                 }
             }
+        }
+
+        ["whitelist", "list"] => {
+            let mut out = cli_state
+                .lock()
+                .await
+                .whitelist
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            out.sort();
+            serde_json::json!({"whitelist": out})
+        }
+        ["whitelist", "add", node_id] => {
+            if node_id.len() != 64 || !node_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return serde_json::json!({"error":"node_id must be 64 hex chars"});
+            }
+            cli_state
+                .lock()
+                .await
+                .whitelist
+                .insert((*node_id).to_string());
+            serde_json::json!({"ok":true})
+        }
+        ["whitelist", "del", node_id] => {
+            cli_state.lock().await.whitelist.remove(*node_id);
+            serde_json::json!({"ok":true})
+        }
+        ["blacklist", "list"] => {
+            let mut out = cli_state
+                .lock()
+                .await
+                .blacklist
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            out.sort();
+            serde_json::json!({"blacklist": out})
+        }
+        ["blacklist", "add", node_id] => {
+            if node_id.len() != 64 || !node_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return serde_json::json!({"error":"node_id must be 64 hex chars"});
+            }
+            cli_state
+                .lock()
+                .await
+                .blacklist
+                .insert((*node_id).to_string());
+            serde_json::json!({"ok":true})
+        }
+        ["blacklist", "del", node_id] => {
+            cli_state.lock().await.blacklist.remove(*node_id);
+            serde_json::json!({"ok":true})
         }
         _ => serde_json::json!({"error":"unknown command"}),
     }
