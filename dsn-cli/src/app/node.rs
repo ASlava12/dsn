@@ -201,6 +201,8 @@ async fn run_foreground(
         let _ = std::fs::remove_file(&control_sock_path);
     }
     let (admin_shutdown_tx, mut admin_shutdown_rx) = tokio::sync::watch::channel(false);
+    let metrics_bucket =
+        std::sync::Arc::new(Mutex::new(dsn_core::TokenBucket::new(8, 8, now_us())));
     let control_task = tokio::spawn(run_control_socket_server(
         control_sock_path.clone(),
         dht,
@@ -209,6 +211,7 @@ async fn run_foreground(
         name_registry_path,
         admin_shutdown_tx,
         handle.stats_arc(),
+        metrics_bucket,
         std::process::id(),
     ));
 
@@ -310,6 +313,13 @@ async fn read_pid(path: &Path) -> Result<Option<u32>> {
     Ok(Some(pid))
 }
 
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
 async fn process_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
@@ -386,6 +396,11 @@ mod tests {
             registry_path,
             tx,
             Arc::new(Mutex::new(RuntimeStats::default())),
+            Arc::new(Mutex::new(dsn_core::TokenBucket::new(
+                2,
+                2,
+                super::now_us(),
+            ))),
             1,
         )
         .await
@@ -489,6 +504,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_endpoint_is_rate_limited() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "dsn-metrics-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let dht = Arc::new(Mutex::new(DhtRuntime::new([3; 32], true)));
+        let cli_state = Arc::new(Mutex::new(DhtCliState::default()));
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let stats = Arc::new(Mutex::new(RuntimeStats::default()));
+        let bucket = Arc::new(Mutex::new(dsn_core::TokenBucket::new(
+            2,
+            2,
+            super::now_us(),
+        )));
+
+        let first = handle_admin_request(
+            "metrics",
+            dht.clone(),
+            "node-a",
+            cli_state.clone(),
+            &registry_path,
+            shutdown_tx.clone(),
+            stats.clone(),
+            bucket.clone(),
+            1,
+        )
+        .await;
+        assert!(first.get("active_sessions").is_some());
+
+        let second = handle_admin_request(
+            "metrics",
+            dht.clone(),
+            "node-a",
+            cli_state.clone(),
+            &registry_path,
+            shutdown_tx,
+            stats,
+            bucket,
+            1,
+        )
+        .await;
+        assert!(second.get("active_sessions").is_some());
+
+        let third = handle_admin_request(
+            "metrics",
+            dht,
+            "node-a",
+            cli_state,
+            &registry_path,
+            tokio::sync::watch::channel(false).0,
+            Arc::new(Mutex::new(RuntimeStats::default())),
+            Arc::new(Mutex::new(dsn_core::TokenBucket::new(
+                0,
+                0,
+                super::now_us(),
+            ))),
+            1,
+        )
+        .await;
+        assert_eq!(
+            third.get("error").and_then(|v| v.as_str()),
+            Some("metrics rate limit exceeded")
+        );
+
+        let _ = tokio::fs::remove_file(&registry_path).await;
+    }
+
+    #[tokio::test]
     async fn name_get_can_read_persisted_registry() {
         let registry_path = std::env::temp_dir().join(format!(
             "dsn-name-registry-{}-{}.json",
@@ -527,6 +614,7 @@ async fn run_control_socket_server(
     registry_path: PathBuf,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     stats: std::sync::Arc<Mutex<RuntimeStats>>,
+    metrics_bucket: std::sync::Arc<Mutex<dsn_core::TokenBucket>>,
     pid: u32,
 ) -> Result<()> {
     let listener = UnixListener::bind(&sock_path)
@@ -540,6 +628,7 @@ async fn run_control_socket_server(
         let registry_path = registry_path.clone();
         let shutdown_tx = shutdown_tx.clone();
         let stats = stats.clone();
+        let metrics_bucket = metrics_bucket.clone();
         tokio::spawn(async move {
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
@@ -555,6 +644,7 @@ async fn run_control_socket_server(
                         &registry_path,
                         shutdown_tx,
                         stats,
+                        metrics_bucket,
                         pid,
                     )
                     .await
@@ -576,6 +666,7 @@ async fn handle_admin_request(
     registry_path: &Path,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     stats: std::sync::Arc<Mutex<RuntimeStats>>,
+    metrics_bucket: std::sync::Arc<Mutex<dsn_core::TokenBucket>>,
     pid: u32,
 ) -> serde_json::Value {
     let parts: Vec<&str> = request.split_whitespace().collect();
@@ -593,6 +684,31 @@ async fn handle_admin_request(
                 "last_tick_us": snapshot.last_tick_us,
                 "listen_endpoints": snapshot.listen_endpoints,
                 "bootstrap_peers": snapshot.bootstrap_peers
+            })
+        }
+        ["metrics"] => {
+            if metrics_bucket
+                .lock()
+                .await
+                .try_consume(now_us(), 1)
+                .is_err()
+            {
+                return serde_json::json!({"error":"metrics rate limit exceeded"});
+            }
+            let snapshot = stats.lock().await.clone();
+            serde_json::json!({
+                "active_sessions": snapshot.active_sessions,
+                "rtt_last_us": snapshot.rtt_last_us,
+                "rtt_avg_us": snapshot.rtt_avg_us,
+                "rekey_started": snapshot.rekey_started,
+                "rekey_completed": snapshot.rekey_completed,
+                "dropped_frames_total": snapshot.dropped_frames_total,
+                "dropped_control_frames": snapshot.dropped_control_frames,
+                "dropped_net_frames": snapshot.dropped_net_frames,
+                "dropped_data_frames": snapshot.dropped_data_frames,
+                "queue_depth_control": snapshot.queue_depth_control,
+                "queue_depth_net": snapshot.queue_depth_net,
+                "queue_depth_data": snapshot.queue_depth_data
             })
         }
         ["shutdown"] => {

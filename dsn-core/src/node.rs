@@ -60,6 +60,16 @@ pub struct RuntimeStats {
     pub rekey_by_age: u64,
     pub route_forwarded: u64,
     pub route_delivered: u64,
+    pub dropped_frames_total: u64,
+    pub dropped_control_frames: u64,
+    pub dropped_net_frames: u64,
+    pub dropped_data_frames: u64,
+    pub queue_depth_control: u64,
+    pub queue_depth_net: u64,
+    pub queue_depth_data: u64,
+    pub rtt_last_us: u64,
+    pub rtt_avg_us: u64,
+    pub rtt_samples: u64,
 }
 
 struct ReplayWindow {
@@ -114,6 +124,7 @@ struct PeerRuntime {
     peer_verify_key: VerifyingKey,
     peer_node_id: [u8; 32],
     pending_rekey: Arc<Mutex<Option<PendingRekeyKeys>>>,
+    stats: Arc<Mutex<RuntimeStats>>,
 }
 
 struct DhtRequestManager {
@@ -217,6 +228,7 @@ pub struct NodeRuntime {
     node_id: [u8; 32],
     peer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     dht_requests: Arc<DhtRequestManager>,
+    dht_inbound_bucket: Arc<Mutex<TokenBucket>>,
     node_contact_challenges: Arc<Mutex<HashMap<[u8; 32], NodeContactChallengeState>>>,
     node_contact_bucket: Arc<Mutex<TokenBucket>>,
     route_manager: Arc<Mutex<RouteManager>>,
@@ -273,12 +285,23 @@ impl NodeRuntime {
                 rekey_by_age: 0,
                 route_forwarded: 0,
                 route_delivered: 0,
+                dropped_frames_total: 0,
+                dropped_control_frames: 0,
+                dropped_net_frames: 0,
+                dropped_data_frames: 0,
+                queue_depth_control: 0,
+                queue_depth_net: 0,
+                queue_depth_data: 0,
+                rtt_last_us: 0,
+                rtt_avg_us: 0,
+                rtt_samples: 0,
             })),
             signing,
             verifying,
             node_id,
             peer_tasks: Arc::new(Mutex::new(Vec::new())),
             dht_requests: Arc::new(DhtRequestManager::new()),
+            dht_inbound_bucket: Arc::new(Mutex::new(TokenBucket::new(256, 128, now))),
             node_contact_challenges: Arc::new(Mutex::new(HashMap::new())),
             node_contact_bucket: Arc::new(Mutex::new(TokenBucket::new(32, 16, now))),
             route_manager: Arc::new(Mutex::new(init_route_manager(&cfg))),
@@ -720,8 +743,23 @@ async fn handshake_and_build_peer(
         peer_verify_key,
         peer_node_id,
         pending_rekey: Arc::new(Mutex::new(None)),
+        stats: runtime.stats.clone(),
     });
     Ok(peer)
+}
+
+async fn note_drop(peer: &PeerRuntime, class: crate::FrameClass) {
+    let mut st = peer.stats.lock().await;
+    st.dropped_frames_total = st.dropped_frames_total.saturating_add(1);
+    match class {
+        crate::FrameClass::Control => {
+            st.dropped_control_frames = st.dropped_control_frames.saturating_add(1)
+        }
+        crate::FrameClass::Net => st.dropped_net_frames = st.dropped_net_frames.saturating_add(1),
+        crate::FrameClass::Data => {
+            st.dropped_data_frames = st.dropped_data_frames.saturating_add(1)
+        }
+    }
 }
 
 async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, peer_key: String) {
@@ -729,23 +767,31 @@ async fn run_peer_read_loop(runtime: Arc<NodeRuntime>, peer: Arc<PeerRuntime>, p
         let aad = build_aad(frame.class as u8, frame.msg_type, frame.flags);
         let enc = match decode_encrypted_payload(&frame.payload) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                note_drop(&peer, frame.class).await;
+                continue;
+            }
         };
 
         let now = now_us();
         {
             let sess = peer.session.lock().await;
             if !sess.can_accept_key_id(enc.key_id, now) {
+                note_drop(&peer, frame.class).await;
                 continue;
             }
         }
         if !peer.replay.lock().await.accept(enc.seq) {
+            note_drop(&peer, frame.class).await;
             continue;
         }
         let keys = { peer.keys.lock().await.clone() };
         let plain = match crate::decrypt_frame(&keys, &enc, &aad) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                note_drop(&peer, frame.class).await;
+                continue;
+            }
         };
 
         if frame.class == crate::FrameClass::Control
@@ -779,12 +825,23 @@ async fn handle_control_message(
         }
         ControlMessage::Pong(p) => {
             let mut sess = peer.session.lock().await;
-            let _ = sess.handle_pong(
+            if let Ok(rtt_us) = sess.handle_pong(
                 crate::Pong {
                     request_id: p.request_id,
                 },
                 now_us(),
-            );
+            ) {
+                let mut st = runtime.stats.lock().await;
+                st.rtt_last_us = rtt_us;
+                st.rtt_samples = st.rtt_samples.saturating_add(1);
+                if st.rtt_samples == 1 {
+                    st.rtt_avg_us = rtt_us;
+                } else {
+                    st.rtt_avg_us = ((st.rtt_avg_us as u128 * (st.rtt_samples - 1) as u128)
+                        .saturating_add(rtt_us as u128)
+                        / st.rtt_samples as u128) as u64;
+                }
+            }
         }
         ControlMessage::SessionChangeRequest(req) => {
             handle_rekey_request(runtime, peer, req).await;
@@ -793,15 +850,55 @@ async fn handle_control_message(
             handle_rekey_ack(runtime, peer, ack).await;
         }
         ControlMessage::FindNode(msg) => {
+            if runtime
+                .dht_inbound_bucket
+                .lock()
+                .await
+                .try_consume(now_us(), 1)
+                .is_err()
+            {
+                note_drop(&peer, crate::FrameClass::Control).await;
+                return;
+            }
             handle_dht_find_node(runtime, peer, msg).await;
         }
         ControlMessage::FindValue(msg) => {
+            if runtime
+                .dht_inbound_bucket
+                .lock()
+                .await
+                .try_consume(now_us(), 1)
+                .is_err()
+            {
+                note_drop(&peer, crate::FrameClass::Control).await;
+                return;
+            }
             handle_dht_find_value(runtime, peer, msg).await;
         }
         ControlMessage::Store(msg) => {
+            if runtime
+                .dht_inbound_bucket
+                .lock()
+                .await
+                .try_consume(now_us(), 1)
+                .is_err()
+            {
+                note_drop(&peer, crate::FrameClass::Control).await;
+                return;
+            }
             handle_dht_store(runtime, peer, msg).await;
         }
         ControlMessage::Delete(msg) => {
+            if runtime
+                .dht_inbound_bucket
+                .lock()
+                .await
+                .try_consume(now_us(), 1)
+                .is_err()
+            {
+                note_drop(&peer, crate::FrameClass::Control).await;
+                return;
+            }
             handle_dht_delete(runtime, peer, msg).await;
         }
         ControlMessage::NodeContact(msg) => {
@@ -1124,10 +1221,24 @@ async fn send_control(peer: Arc<PeerRuntime>, msg: ControlMessage) -> Result<()>
     let keys = { peer.keys.lock().await.clone() };
     let enc = crate::encrypt_frame(&keys, key_id, seq, &payload, &aad)?;
     let framed_payload = encode_encrypted_payload(&enc);
-    peer.links
+    {
+        let mut st = peer.stats.lock().await;
+        st.queue_depth_control = st.queue_depth_control.saturating_add(1);
+    }
+    let send_res = peer
+        .links
         .send_control(frame_msg_type, 0, framed_payload)
         .await
-        .map_err(|e| anyhow!("send control failed: {e}"))?;
+        .map_err(|e| anyhow!("send control failed: {e}"));
+    {
+        let mut st = peer.stats.lock().await;
+        st.queue_depth_control = st.queue_depth_control.saturating_sub(1);
+        if send_res.is_err() {
+            st.dropped_frames_total = st.dropped_frames_total.saturating_add(1);
+            st.dropped_control_frames = st.dropped_control_frames.saturating_add(1);
+        }
+    }
+    send_res?;
     peer.session.lock().await.on_bytes_sent(payload.len());
     Ok(())
 }
@@ -1139,10 +1250,24 @@ async fn send_net(peer: Arc<PeerRuntime>, msg_type: u16, payload: Vec<u8>) -> Re
     let keys = { peer.keys.lock().await.clone() };
     let enc = crate::encrypt_frame(&keys, key_id, seq, &payload, &aad)?;
     let framed_payload = encode_encrypted_payload(&enc);
-    peer.links
+    {
+        let mut st = peer.stats.lock().await;
+        st.queue_depth_net = st.queue_depth_net.saturating_add(1);
+    }
+    let send_res = peer
+        .links
         .send_net(msg_type, 0, framed_payload)
         .await
-        .map_err(|e| anyhow!("send net failed: {e}"))?;
+        .map_err(|e| anyhow!("send net failed: {e}"));
+    {
+        let mut st = peer.stats.lock().await;
+        st.queue_depth_net = st.queue_depth_net.saturating_sub(1);
+        if send_res.is_err() {
+            st.dropped_frames_total = st.dropped_frames_total.saturating_add(1);
+            st.dropped_net_frames = st.dropped_net_frames.saturating_add(1);
+        }
+    }
+    send_res?;
     peer.session.lock().await.on_bytes_sent(payload.len());
     Ok(())
 }
@@ -1154,12 +1279,36 @@ async fn send_data(peer: Arc<PeerRuntime>, msg_type: u16, payload: Vec<u8>) -> R
     let keys = { peer.keys.lock().await.clone() };
     let enc = crate::encrypt_frame(&keys, key_id, seq, &payload, &aad)?;
     let framed_payload = encode_encrypted_payload(&enc);
-    let accepted = peer
+    {
+        let mut st = peer.stats.lock().await;
+        st.queue_depth_data = st.queue_depth_data.saturating_add(1);
+    }
+    let accepted_res = peer
         .links
         .send_data(msg_type, 0, framed_payload)
         .await
-        .map_err(|e| anyhow!("send data failed: {e}"))?;
-    if !accepted {
+        .map_err(|e| anyhow!("send data failed: {e}"));
+    let mut dropped_backpressure = false;
+    let accepted = match accepted_res {
+        Ok(v) => v,
+        Err(e) => {
+            let mut st = peer.stats.lock().await;
+            st.queue_depth_data = st.queue_depth_data.saturating_sub(1);
+            st.dropped_frames_total = st.dropped_frames_total.saturating_add(1);
+            st.dropped_data_frames = st.dropped_data_frames.saturating_add(1);
+            return Err(e);
+        }
+    };
+    {
+        let mut st = peer.stats.lock().await;
+        st.queue_depth_data = st.queue_depth_data.saturating_sub(1);
+        if !accepted {
+            dropped_backpressure = true;
+            st.dropped_frames_total = st.dropped_frames_total.saturating_add(1);
+            st.dropped_data_frames = st.dropped_data_frames.saturating_add(1);
+        }
+    }
+    if dropped_backpressure {
         return Err(anyhow!("data queue backpressure"));
     }
     peer.session.lock().await.on_bytes_sent(payload.len());
