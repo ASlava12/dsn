@@ -602,6 +602,14 @@ impl NodeRuntimeHandle {
 async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
     let mut tasks = Vec::new();
     for endpoint in runtime.cfg.listen.clone() {
+        if endpoint.scheme == crate::TransportScheme::Udp {
+            tracing::warn!(
+                "node runtime listener ignores unsupported datagram endpoint: {}",
+                format!("{}://{}:{}", endpoint.scheme, endpoint.host, endpoint.port)
+            );
+            continue;
+        }
+
         let rt = runtime.clone();
         let mut srx = shutdown.clone();
         tasks.push(tokio::spawn(async move {
@@ -611,12 +619,18 @@ async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Rece
                         if *srx.borrow() { break; }
                     }
                     accepted = accept_once(&rt, &endpoint) => {
-                        if let Ok(peer) = accepted {
-                            let key = format!("inbound-{}", now_us());
-                            rt.peers.write().await.insert(key.clone(), peer.clone());
-                            let task = tokio::spawn(run_peer_read_loop(rt.clone(), peer, key));
-                            rt.peer_tasks.lock().await.push(task);
-                            rt.stats.lock().await.active_sessions = rt.peers.read().await.len();
+                        match accepted {
+                            Ok(peer) => {
+                                let key = format!("inbound-{}", now_us());
+                                rt.peers.write().await.insert(key.clone(), peer.clone());
+                                let task = tokio::spawn(run_peer_read_loop(rt.clone(), peer, key));
+                                rt.peer_tasks.lock().await.push(task);
+                                rt.stats.lock().await.active_sessions = rt.peers.read().await.len();
+                            }
+                            Err(err) => {
+                                tracing::warn!("listener accept failed on {}: {err:#}", format!("{}://{}:{}", endpoint.scheme, endpoint.host, endpoint.port));
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
                         }
                     }
                 }
@@ -2341,6 +2355,21 @@ mod tests {
         pkt[16..20].copy_from_slice(&dst);
         pkt[20..].copy_from_slice(payload);
         pkt
+    }
+
+    #[tokio::test]
+    async fn udp_listener_endpoint_is_ignored_without_busy_loop() -> Result<()> {
+        let mut cfg = DsnConfig::default_with_generated_identity()?;
+        cfg.listen = vec!["udp://127.0.0.1:19904".parse()?];
+
+        let node = NodeRuntime::new(cfg).start();
+        sleep(Duration::from_millis(300)).await;
+
+        let snap = node.snapshot().await;
+        assert_eq!(snap.active_sessions, 0);
+
+        node.stop().await;
+        Ok(())
     }
 
     #[tokio::test]
