@@ -605,6 +605,7 @@ async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Rece
         let rt = runtime.clone();
         let mut srx = shutdown.clone();
         tasks.push(tokio::spawn(async move {
+            let single_peer_listener = endpoint.scheme == crate::TransportScheme::Udp;
             loop {
                 tokio::select! {
                     _ = srx.changed() => {
@@ -618,6 +619,9 @@ async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Rece
                                 let task = tokio::spawn(run_peer_read_loop(rt.clone(), peer, key));
                                 rt.peer_tasks.lock().await.push(task);
                                 rt.stats.lock().await.active_sessions = rt.peers.read().await.len();
+                                if single_peer_listener {
+                                    break;
+                                }
                             }
                             Err(err) => {
                                 tracing::warn!("listener accept failed on {}://{}:{}: {err:#}", endpoint.scheme, endpoint.host, endpoint.port);
