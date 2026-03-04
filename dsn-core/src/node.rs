@@ -45,6 +45,7 @@ const DATA_MSG_ROUTE_SEND_IP6: u16 = 0x0301;
 const DHT_NAMESPACE_IP4: &str = "ip4";
 const DHT_NAMESPACE_IP6: &str = "ip6";
 const SESSION_STORE_FLUSH_INTERVAL_SECS: u64 = 10;
+const UDP_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeStats {
@@ -650,7 +651,7 @@ async fn accept_once(
     let transport = transport_for_scheme(endpoint.scheme)?;
     let conn = transport.listen(endpoint).await?;
     let stream = connection_into_mux_stream(conn, endpoint, false).await?;
-    handshake_and_build_peer(runtime.clone(), stream, false).await
+    handshake_with_timeout(runtime.clone(), endpoint.scheme, stream, false).await
 }
 
 async fn connection_into_mux_stream(
@@ -751,7 +752,7 @@ async fn run_outbound_dial_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::
                         Ok(s) => s,
                         Err(_) => continue,
                     };
-                    if let Ok(peer) = handshake_and_build_peer(runtime.clone(), stream, true).await {
+                    if let Ok(peer) = handshake_with_timeout(runtime.clone(), endpoint.scheme, stream, true).await {
                         runtime.peers.write().await.insert(key.clone(), peer.clone());
                         let task = tokio::spawn(run_peer_read_loop(runtime.clone(), peer, key));
                         runtime.peer_tasks.lock().await.push(task);
@@ -765,6 +766,24 @@ async fn run_outbound_dial_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::
             }
         }
     }
+}
+
+async fn handshake_with_timeout(
+    runtime: Arc<NodeRuntime>,
+    scheme: crate::TransportScheme,
+    stream: crate::BoxedStreamConn,
+    outbound: bool,
+) -> Result<Arc<PeerRuntime>> {
+    if scheme == crate::TransportScheme::Udp {
+        return tokio::time::timeout(
+            Duration::from_secs(UDP_HANDSHAKE_TIMEOUT_SECS),
+            handshake_and_build_peer(runtime, stream, outbound),
+        )
+        .await
+        .map_err(|_| anyhow!("udp handshake timed out"))?;
+    }
+
+    handshake_and_build_peer(runtime, stream, outbound).await
 }
 
 async fn handshake_and_build_peer(
