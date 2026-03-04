@@ -11,7 +11,9 @@ pub mod session_store;
 
 pub use control::{
     CONTROL_PROTOCOL_V1, ControlCodecError, ControlMessage, ControlMsgType, Delete, FindNode,
-    FindValue, NodeContact, Ping as ControlPing, Pong as ControlPong, Store,
+    FindValue, NodeContact, Ping as ControlPing, Pong as ControlPong, REKEY_ACK_OK,
+    REKEY_ACK_REJECTED, SessionChangeAck as ControlSessionChangeAck,
+    SessionChangeRequest as ControlSessionChangeRequest, Store,
 };
 
 pub use frame::{
@@ -37,7 +39,7 @@ pub use route::{
 };
 
 pub use session::{
-    Ping, Pong, REKEY_AGE_THRESHOLD_US_V1, REKEY_BYTES_THRESHOLD_V1, SessionChangeAck,
+    Ping, Pong, REKEY_AGE_THRESHOLD_US_V1, REKEY_BYTES_THRESHOLD_V1, RekeyReason, SessionChangeAck,
     SessionChangeRequest, SessionPolicy, SessionState,
 };
 

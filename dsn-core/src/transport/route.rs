@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 
-pub const ROUTE_TTL_US: u64 = 60 * 60 * 1_000_000;
+pub const ROUTE_TTL_US: u64 = 300 * 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteEntry {

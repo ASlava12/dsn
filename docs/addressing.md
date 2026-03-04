@@ -11,6 +11,12 @@ address_mode:
   all
 ```
 
+Человекочитаемые синонимы режимов:
+
+- `only public` -> `public_only`
+- `only gray` -> `gray_only`
+- `all` -> `all`
+
 ## 2. Gray address definition
 
 ### IPv4 gray ranges
@@ -46,10 +52,10 @@ ip6_exclude_net: [CIDR]
 
 ## 5. Filtering pipeline (обязательный порядок)
 
-1. **hard deny**
-2. **address_mode**
+1. **hard deny** (включая loopback)
+2. **exclude**
 3. **include** (если список непустой)
-4. **exclude**
+4. **address_mode**
 
 Решение `allow/deny` должно быть детерминированным и логироваться в debug trace.
 

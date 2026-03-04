@@ -36,6 +36,14 @@ pub struct NodeConfig {
     pub state_dir: String,
     #[serde(default = "default_control_socket")]
     pub control_socket: String,
+    #[serde(default = "default_session_store")]
+    pub session_store: String,
+    #[serde(default = "default_session_store_path")]
+    pub session_store_path: String,
+    #[serde(default)]
+    pub session_store_redis_url: Option<String>,
+    #[serde(default = "default_session_store_redis_prefix")]
+    pub session_store_redis_prefix: String,
 }
 
 fn default_state_dir() -> String {
@@ -46,11 +54,27 @@ fn default_control_socket() -> String {
     "control.sock".to_string()
 }
 
+fn default_session_store() -> String {
+    "memory".to_string()
+}
+
+fn default_session_store_path() -> String {
+    "sessions".to_string()
+}
+
+fn default_session_store_redis_prefix() -> String {
+    "dsn:sessions:v1".to_string()
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             state_dir: default_state_dir(),
             control_socket: default_control_socket(),
+            session_store: default_session_store(),
+            session_store_path: default_session_store_path(),
+            session_store_redis_url: None,
+            session_store_redis_prefix: default_session_store_redis_prefix(),
         }
     }
 }
@@ -84,6 +108,27 @@ pub struct DsnConfig {
 
     #[serde(default)]
     pub node: NodeConfig,
+
+    #[serde(default)]
+    pub route_whitelist_node_ids: Vec<String>,
+
+    #[serde(default)]
+    pub route_blacklist_node_ids: Vec<String>,
+
+    #[serde(default)]
+    pub tun_enabled: bool,
+
+    #[serde(default)]
+    pub tun_use_ip4: bool,
+
+    #[serde(default)]
+    pub tun_use_ip6: bool,
+
+    #[serde(default)]
+    pub tun_ip4: Option<String>,
+
+    #[serde(default)]
+    pub tun_ip6: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +152,13 @@ impl DsnConfig {
             ip6_include_net: Vec::new(),
             ip6_exclude_net: Vec::new(),
             node: NodeConfig::default(),
+            route_whitelist_node_ids: Vec::new(),
+            route_blacklist_node_ids: Vec::new(),
+            tun_enabled: false,
+            tun_use_ip4: false,
+            tun_use_ip6: false,
+            tun_ip4: None,
+            tun_ip6: None,
         })
     }
 
@@ -151,6 +203,8 @@ impl DsnConfig {
         self.validate_transport_endpoints()?;
         self.validate_address_filters()?;
         self.validate_node_paths()?;
+        self.validate_route_acl()?;
+        self.validate_tun_config()?;
 
         Ok(())
     }
@@ -193,6 +247,76 @@ impl DsnConfig {
         }
         if self.node.control_socket.trim().is_empty() {
             bail!("node.control_socket must not be empty");
+        }
+        match self.node.session_store.as_str() {
+            "memory" => {}
+            "file" => {
+                if self.node.session_store_path.trim().is_empty() {
+                    bail!("node.session_store_path must not be empty for store=file");
+                }
+            }
+            "redis" => {
+                let url = self
+                    .node
+                    .session_store_redis_url
+                    .as_deref()
+                    .ok_or_else(|| {
+                        anyhow!("node.session_store_redis_url is required for store=redis")
+                    })?;
+                crate::transport::validate_redis_session_store_uri(url)?;
+                if self.node.session_store_redis_prefix.trim().is_empty() {
+                    bail!("node.session_store_redis_prefix must not be empty for store=redis");
+                }
+            }
+            other => bail!("node.session_store must be one of: memory|file|redis, got '{other}'"),
+        }
+        Ok(())
+    }
+
+    fn validate_route_acl(&self) -> Result<()> {
+        for (label, entries) in [
+            ("route_whitelist_node_ids", &self.route_whitelist_node_ids),
+            ("route_blacklist_node_ids", &self.route_blacklist_node_ids),
+        ] {
+            for (idx, node_id) in entries.iter().enumerate() {
+                if node_id.len() != 64 || !node_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("{label}[{idx}] must be 64 hex characters");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tun_config(&self) -> Result<()> {
+        if !self.tun_enabled {
+            return Ok(());
+        }
+        if !self.tun_use_ip4 && !self.tun_use_ip6 {
+            bail!("tun_enabled requires tun_use_ip4 and/or tun_use_ip6");
+        }
+        if self.tun_use_ip4 {
+            let raw = self
+                .tun_ip4
+                .as_ref()
+                .ok_or_else(|| anyhow!("tun_use_ip4 requires tun_ip4"))?;
+            let ip: Ipv4Addr = raw
+                .parse()
+                .with_context(|| format!("invalid tun_ip4 '{raw}'"))?;
+            if !self.is_allowed_ipv4(ip) {
+                bail!("tun_ip4 '{raw}' is not allowed by address filters/mode");
+            }
+        }
+        if self.tun_use_ip6 {
+            let raw = self
+                .tun_ip6
+                .as_ref()
+                .ok_or_else(|| anyhow!("tun_use_ip6 requires tun_ip6"))?;
+            let ip: Ipv6Addr = raw
+                .parse()
+                .with_context(|| format!("invalid tun_ip6 '{raw}'"))?;
+            if !self.is_allowed_ipv6(ip) {
+                bail!("tun_ip6 '{raw}' is not allowed by address filters/mode");
+            }
         }
         Ok(())
     }
@@ -275,6 +399,14 @@ fn is_allowed_ipv4(
         return false;
     }
 
+    if exclude.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
     let in_gray = is_gray_ipv4(addr);
     let mode_allowed = match mode {
         AddressMode::PublicOnly => !in_gray,
@@ -283,14 +415,6 @@ fn is_allowed_ipv4(
     };
 
     if !mode_allowed {
-        return false;
-    }
-
-    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
-        return false;
-    }
-
-    if exclude.iter().any(|n| n.contains(&addr)) {
         return false;
     }
 
@@ -307,6 +431,14 @@ fn is_allowed_ipv6(
         return false;
     }
 
+    if exclude.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
+    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
+        return false;
+    }
+
     let in_gray = is_gray_ipv6(addr);
     let mode_allowed = match mode {
         AddressMode::PublicOnly => is_ipv6_gua(addr),
@@ -315,14 +447,6 @@ fn is_allowed_ipv6(
     };
 
     if !mode_allowed {
-        return false;
-    }
-
-    if !include.is_empty() && !include.iter().any(|n| n.contains(&addr)) {
-        return false;
-    }
-
-    if exclude.iter().any(|n| n.contains(&addr)) {
         return false;
     }
 
@@ -783,6 +907,61 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tun_validation_requires_ip_mode_when_enabled() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.tun_enabled = true;
+
+        let err = cfg
+            .validate()
+            .expect_err("tun must require at least one ip mode");
+        assert!(
+            err.to_string()
+                .contains("tun_enabled requires tun_use_ip4 and/or tun_use_ip6")
+        );
+    }
+
+    #[test]
+    fn tun_validation_checks_filters() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.address_mode = AddressMode::PublicOnly;
+        cfg.tun_enabled = true;
+        cfg.tun_use_ip4 = true;
+        cfg.tun_ip4 = Some("10.10.10.2".to_string());
+
+        let err = cfg
+            .validate()
+            .expect_err("private ip should be rejected in public_only");
+        assert!(
+            err.to_string()
+                .contains("tun_ip4 '10.10.10.2' is not allowed")
+        );
+    }
+
+    #[test]
+    fn validate_accepts_supported_session_store_variants() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.node.session_store = "file".to_string();
+        cfg.node.session_store_path = "sessions-dir".to_string();
+        cfg.validate().expect("file session store should validate");
+
+        cfg.node.session_store = "redis".to_string();
+        cfg.node.session_store_redis_url = Some("redis://localhost/0".to_string());
+        cfg.validate().expect("redis session store should validate");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_session_store_variant() {
+        let mut cfg = DsnConfig::default_with_generated_identity().expect("default config");
+        cfg.node.session_store = "sqlite".to_string();
+
+        let err = cfg.validate().expect_err("unknown store must fail");
+        assert!(
+            err.to_string()
+                .contains("node.session_store must be one of")
+        );
     }
 
     #[test]

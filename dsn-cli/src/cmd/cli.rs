@@ -56,6 +56,31 @@ pub enum NodeCommands {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    Whitelist {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        command: NodeAclCommands,
+    },
+    Blacklist {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        command: NodeAclCommands,
+    },
+}
+
+#[derive(Parser, Debug)]
+pub struct NodeAclArgs {
+    #[command(subcommand)]
+    pub command: NodeAclCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NodeAclCommands {
+    List,
+    Add { node_id: String },
+    Del { node_id: String },
 }
 
 #[derive(Parser, Debug)]

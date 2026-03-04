@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+use crate::transport::PersistedPeerSession;
+
 pub const REKEY_BYTES_THRESHOLD_V1: u64 = 64 * 1024 * 1024 * 1024;
 pub const REKEY_AGE_THRESHOLD_US_V1: u64 = 24 * 60 * 60 * 1_000_000;
 
@@ -72,6 +74,12 @@ pub struct SessionState {
     rtt_ring_us: VecDeque<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekeyReason {
+    Bytes,
+    Age,
+}
+
 impl SessionState {
     pub fn new(policy: SessionPolicy, initial_key_id: u32, now_us: u64) -> Self {
         Self {
@@ -91,11 +99,53 @@ impl SessionState {
         self.active_key_id
     }
 
+    pub fn from_persisted(
+        policy: SessionPolicy,
+        persisted: PersistedPeerSession,
+        now_us: u64,
+        initial_key_id: u32,
+    ) -> Self {
+        // Persisted store intentionally does not keep session key material.
+        // On restart we must reset cryptographic key lineage to handshake baseline.
+        Self {
+            policy,
+            active_key_id: initial_key_id,
+            active_key_since_us: now_us,
+            bytes_on_active_key: 0,
+            pending_rekey: None,
+            previous_key_grace: None,
+            last_pong_us: persisted.last_pong_us.min(now_us),
+            pending_pings: HashMap::new(),
+            rtt_ring_us: VecDeque::with_capacity(5),
+        }
+    }
+
+    pub fn snapshot(&self, peer_node_id: [u8; 32]) -> PersistedPeerSession {
+        PersistedPeerSession {
+            version: 1,
+            peer_node_id,
+            active_key_id: self.active_key_id,
+            bytes_on_active_key: self.bytes_on_active_key,
+            active_key_since_us: self.active_key_since_us,
+            last_pong_us: self.last_pong_us,
+        }
+    }
+
     pub fn should_rekey(&self, now_us: u64) -> bool {
-        self.pending_rekey.is_none()
-            && (self.bytes_on_active_key >= self.policy.rekey_bytes_threshold
-                || now_us.saturating_sub(self.active_key_since_us)
-                    >= self.policy.rekey_age_threshold_us)
+        self.rekey_reason(now_us).is_some()
+    }
+
+    pub fn rekey_reason(&self, now_us: u64) -> Option<RekeyReason> {
+        if self.pending_rekey.is_some() {
+            return None;
+        }
+        if self.bytes_on_active_key >= self.policy.rekey_bytes_threshold {
+            return Some(RekeyReason::Bytes);
+        }
+        if now_us.saturating_sub(self.active_key_since_us) >= self.policy.rekey_age_threshold_us {
+            return Some(RekeyReason::Age);
+        }
+        None
     }
 
     pub fn on_bytes_sent(&mut self, bytes: usize) {
@@ -165,6 +215,18 @@ impl SessionState {
             Some(grace) if grace.key_id == key_id && now_us <= grace.until_us => true,
             _ => false,
         }
+    }
+
+    pub fn switch_to_remote_key(&mut self, new_key_id: u32, now_us: u64) {
+        let old_key = self.active_key_id;
+        self.active_key_id = new_key_id;
+        self.active_key_since_us = now_us;
+        self.bytes_on_active_key = 0;
+        self.pending_rekey = None;
+        self.previous_key_grace = Some(PreviousKeyGrace {
+            key_id: old_key,
+            until_us: now_us.saturating_add(self.policy.grace_window_us),
+        });
     }
 
     pub fn track_ping(&mut self, request_id: u64, now_us: u64) -> Ping {
@@ -284,5 +346,16 @@ mod tests {
             .handle_pong(pong, 1_102)
             .expect("pong should recover liveness");
         assert!(!state.is_timed_out(1_150));
+    }
+
+    #[test]
+    fn persisted_snapshot_restores_state() {
+        let mut state = SessionState::new(SessionPolicy::default(), 3, 10);
+        state.on_bytes_sent(77);
+
+        let snap = state.snapshot([9u8; 32]);
+        assert_eq!(snap.version, 1);
+        let restored = SessionState::from_persisted(SessionPolicy::default(), snap, 40, 1);
+        assert_eq!(restored.active_key_id(), 1);
     }
 }
