@@ -602,14 +602,6 @@ impl NodeRuntimeHandle {
 async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
     let mut tasks = Vec::new();
     for endpoint in runtime.cfg.listen.clone() {
-        if endpoint.scheme == crate::TransportScheme::Udp {
-            tracing::warn!(
-                "node runtime listener ignores unsupported datagram endpoint: {}",
-                format!("{}://{}:{}", endpoint.scheme, endpoint.host, endpoint.port)
-            );
-            continue;
-        }
-
         let rt = runtime.clone();
         let mut srx = shutdown.clone();
         tasks.push(tokio::spawn(async move {
@@ -628,7 +620,7 @@ async fn run_listeners_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Rece
                                 rt.stats.lock().await.active_sessions = rt.peers.read().await.len();
                             }
                             Err(err) => {
-                                tracing::warn!("listener accept failed on {}: {err:#}", format!("{}://{}:{}", endpoint.scheme, endpoint.host, endpoint.port));
+                                tracing::warn!("listener accept failed on {}://{}:{}: {err:#}", endpoint.scheme, endpoint.host, endpoint.port);
                                 tokio::time::sleep(Duration::from_millis(200)).await;
                             }
                         }
@@ -653,13 +645,84 @@ async fn accept_once(
 ) -> Result<Arc<PeerRuntime>> {
     let transport = transport_for_scheme(endpoint.scheme)?;
     let conn = transport.listen(endpoint).await?;
-    let stream = match conn {
-        crate::Connection::Stream(s) => s,
-        crate::Connection::Datagram(_) => {
-            return Err(anyhow!("datagram listener unsupported in node mux"));
-        }
-    };
+    let stream = connection_into_mux_stream(conn, endpoint, false).await?;
     handshake_and_build_peer(runtime.clone(), stream, false).await
+}
+
+async fn connection_into_mux_stream(
+    conn: crate::Connection,
+    endpoint: &TransportEndpoint,
+    outbound: bool,
+) -> Result<crate::BoxedStreamConn> {
+    match conn {
+        crate::Connection::Stream(stream) => Ok(stream),
+        crate::Connection::Datagram(datagram) => {
+            datagram_conn_into_stream(datagram, endpoint, outbound).await
+        }
+    }
+}
+
+async fn datagram_conn_into_stream(
+    datagram: Box<dyn crate::DatagramConn>,
+    endpoint: &TransportEndpoint,
+    outbound: bool,
+) -> Result<crate::BoxedStreamConn> {
+    let datagram = Arc::new(datagram);
+    let (left, right) = tokio::io::duplex(64 * 1024);
+    let (mut from_mux, mut to_mux) = tokio::io::split(right);
+
+    let mut first_buf = None;
+    let remote = if outbound {
+        let addr = crate::endpoint_socket_addr(endpoint)?;
+        datagram.connect(addr).await?;
+        Some(addr)
+    } else {
+        let mut buf = vec![0u8; 64 * 1024];
+        let (n, addr) = datagram.recv(&mut buf).await?;
+        datagram.connect(addr).await?;
+        buf.truncate(n);
+        first_buf = Some(buf);
+        Some(addr)
+    };
+
+    let dgram_recv = datagram.clone();
+    tokio::spawn(async move {
+        if let Some(first) = first_buf {
+            if to_mux.write_all(&first).await.is_err() {
+                return;
+            }
+        }
+
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match dgram_recv.recv(&mut buf).await {
+                Ok((n, _)) => {
+                    if to_mux.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let dgram_send = datagram;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match from_mux.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if dgram_send.send(&buf[..n], remote).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(Box::new(left))
 }
 
 async fn run_outbound_dial_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::Receiver<bool>) {
@@ -680,9 +743,9 @@ async fn run_outbound_dial_loop(runtime: Arc<NodeRuntime>, mut shutdown: watch::
                         Ok(c) => c,
                         Err(_) => continue,
                     };
-                    let stream = match conn {
-                        crate::Connection::Stream(s) => s,
-                        crate::Connection::Datagram(_) => continue,
+                    let stream = match connection_into_mux_stream(conn, endpoint, true).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
                     };
                     if let Ok(peer) = handshake_and_build_peer(runtime.clone(), stream, true).await {
                         runtime.peers.write().await.insert(key.clone(), peer.clone());
@@ -2358,17 +2421,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_listener_endpoint_is_ignored_without_busy_loop() -> Result<()> {
-        let mut cfg = DsnConfig::default_with_generated_identity()?;
-        cfg.listen = vec!["udp://127.0.0.1:19904".parse()?];
+    async fn two_nodes_exchange_ping_over_udp_control() -> Result<()> {
+        let mut cfg_a = DsnConfig::default_with_generated_identity()?;
+        let mut cfg_b = DsnConfig::default_with_generated_identity()?;
 
-        let node = NodeRuntime::new(cfg).start();
-        sleep(Duration::from_millis(300)).await;
+        cfg_a.listen = vec!["udp://127.0.0.1:19904".parse()?];
+        cfg_b.listen = vec!["udp://127.0.0.1:19905".parse()?];
+        cfg_a.bootstrap_peers = vec!["udp://127.0.0.1:19905".parse()?];
+        cfg_b.bootstrap_peers = vec!["udp://127.0.0.1:19904".parse()?];
 
-        let snap = node.snapshot().await;
-        assert_eq!(snap.active_sessions, 0);
+        let node_a = NodeRuntime::new(cfg_a).start();
+        let node_b = NodeRuntime::new(cfg_b).start();
 
-        node.stop().await;
+        sleep(Duration::from_secs(8)).await;
+
+        let stats_a = node_a.snapshot().await;
+        let stats_b = node_b.snapshot().await;
+        assert!(stats_a.active_sessions >= 1);
+        assert!(stats_b.active_sessions >= 1);
+
+        node_a.stop().await;
+        node_b.stop().await;
         Ok(())
     }
 
