@@ -1704,7 +1704,7 @@ fn restored_or_new_session_state(
     let persisted = runtime.session_store.load(peer_node_id).ok().flatten();
     match persisted {
         Some(p) if p.version == 1 => {
-            SessionState::from_persisted(default_session_policy(), p, now_us)
+            SessionState::from_persisted(default_session_policy(), p, now_us, 1)
         }
         _ => SessionState::new(default_session_policy(), 1, now_us),
     }
@@ -2295,7 +2295,7 @@ mod tests {
 
         let rt2 = NodeRuntime::new(cfg.clone());
         let restored = super::restored_or_new_session_state(&rt2, peer_id, 333);
-        assert_eq!(restored.active_key_id(), 77);
+        assert_eq!(restored.active_key_id(), 1);
 
         let path = std::path::Path::new(&cfg.node.state_dir);
         let _ = std::fs::remove_dir_all(path);
@@ -2327,7 +2327,7 @@ mod tests {
 
         let rt2 = NodeRuntime::new(cfg);
         let restored = super::restored_or_new_session_state(&rt2, peer_id, 40);
-        assert_eq!(restored.active_key_id(), 55);
+        assert_eq!(restored.active_key_id(), 1);
         Ok(())
     }
 

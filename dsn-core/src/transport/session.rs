@@ -103,12 +103,15 @@ impl SessionState {
         policy: SessionPolicy,
         persisted: PersistedPeerSession,
         now_us: u64,
+        initial_key_id: u32,
     ) -> Self {
+        // Persisted store intentionally does not keep session key material.
+        // On restart we must reset cryptographic key lineage to handshake baseline.
         Self {
             policy,
-            active_key_id: persisted.active_key_id,
-            active_key_since_us: persisted.active_key_since_us,
-            bytes_on_active_key: persisted.bytes_on_active_key,
+            active_key_id: initial_key_id,
+            active_key_since_us: now_us,
+            bytes_on_active_key: 0,
             pending_rekey: None,
             previous_key_grace: None,
             last_pong_us: persisted.last_pong_us.min(now_us),
@@ -352,7 +355,7 @@ mod tests {
 
         let snap = state.snapshot([9u8; 32]);
         assert_eq!(snap.version, 1);
-        let restored = SessionState::from_persisted(SessionPolicy::default(), snap, 40);
-        assert_eq!(restored.active_key_id(), 3);
+        let restored = SessionState::from_persisted(SessionPolicy::default(), snap, 40, 1);
+        assert_eq!(restored.active_key_id(), 1);
     }
 }
